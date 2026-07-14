@@ -97,6 +97,17 @@ internal static class Cli
         return 0;
     }
 
+    /// <summary>Value of a flag like "--out dir"; prints a message instead of throwing when the value is missing.</summary>
+    private static string? FlagValue(string[] args, ref int i)
+    {
+        if (i + 1 >= args.Length)
+        {
+            Console.WriteLine($"missing value after {args[i]}");
+            return null;
+        }
+        return args[++i];
+    }
+
     public static int Find(string[] args)
     {
         if (args.Length == 0)
@@ -112,10 +123,10 @@ internal static class Cli
         {
             switch (args[i])
             {
-                case "--kind": kind = args[++i]; break;
-                case "--category": category = args[++i]; break;
-                case "--path": pathContains = args[++i]; break;
-                case "--limit": limit = int.Parse(args[++i]); break;
+                case "--kind": kind = FlagValue(args, ref i); break;
+                case "--category": category = FlagValue(args, ref i); break;
+                case "--path": pathContains = FlagValue(args, ref i); break;
+                case "--limit": limit = int.TryParse(FlagValue(args, ref i), out var n) ? n : limit; break;
                 default: queryParts.Add(args[i]); break;
             }
         }
@@ -151,9 +162,9 @@ internal static class Cli
         {
             switch (args[i])
             {
-                case "--out": outDir = args[++i]; break;
-                case "--bundles": extraBundles.Add(args[++i]); break;
-                case "--lod": options = options with { LodLevel = int.Parse(args[++i]) }; break;
+                case "--out": outDir = FlagValue(args, ref i) ?? outDir; break;
+                case "--bundles": if (FlagValue(args, ref i) is { } b) { extraBundles.Add(b); } break;
+                case "--lod": options = options with { LodLevel = int.TryParse(FlagValue(args, ref i), out var lod) ? lod : 0 }; break;
                 case "--all-lods": options = options with { AllLods = true }; break;
                 case "--shadows": options = options with { IncludeShadowProxies = true }; break;
                 case "--no-prune": options = options with { PruneEmpties = false }; break;
@@ -179,24 +190,31 @@ internal static class Cli
     }
 
     /// <summary>
-    /// If the target's materials reference textures in unloaded bundles, restart
-    /// the session with exactly those bundles added (automatic dependency closure).
+    /// If the target references assets in unloaded bundles (meshes, materials,
+    /// textures), restart the session with exactly those bundles added. Iterates
+    /// because newly loaded assets can reveal further dependencies (a skinned
+    /// mesh bundle brings materials whose textures live in a third bundle).
     /// </summary>
     internal static Session EnsureTextures(Session session, string query, List<string> extraBundles)
     {
-        var resolved = session.ResolveExportSet(query);
-        if (resolved == null)
+        var loaded = extraBundles;
+        for (var pass = 0; pass < 3; pass++)
         {
-            return session;
+            var resolved = session.ResolveExportSet(query);
+            if (resolved == null)
+            {
+                return session;
+            }
+            var missing = session.FindMissingDependencyBundles(resolved.Value.Assets);
+            if (missing.Count == 0)
+            {
+                return session;
+            }
+            Console.WriteLine($"dependency closure (pass {pass + 1}): loading {missing.Count} additional bundle(s): {string.Join(", ", missing.Select(Path.GetFileName))}");
+            loaded = loaded.Concat(missing).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            session = Session.Start(loaded) ?? session;
         }
-        var missing = session.FindMissingTextureBundles(resolved.Value.Assets);
-        if (missing.Count == 0)
-        {
-            return session;
-        }
-        Console.WriteLine($"texture closure: loading {missing.Count} additional bundle(s): {string.Join(", ", missing.Select(Path.GetFileName))}");
-        var expanded = extraBundles.Concat(missing).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-        return Session.Start(expanded) ?? session;
+        return session;
     }
 
     public static int Mat(string[] args)
@@ -275,10 +293,19 @@ internal static class Cli
                         var outDir = request.QueryString["out"] ?? "export";
                         if (request.QueryString["notex"] == null)
                         {
-                            // automatic texture closure may replace the session with a bigger one
-                            session = Cli.EnsureTextures(session, q, extraBundles);
+                            // dependency closure may replace the session with a bigger one;
+                            // pass the current bundle set so closures accumulate across exports
+                            session = Cli.EnsureTextures(session, q, session.LoadedBundles.ToList());
                         }
-                        var result = session.ExportGlb(q, outDir);
+                        var options = new RipperGlbOptions
+                        {
+                            LodLevel = int.TryParse(request.QueryString["lod"], out var lodLevel) ? lodLevel : 0,
+                            AllLods = request.QueryString["all-lods"] != null,
+                            IncludeShadowProxies = request.QueryString["shadows"] != null,
+                            PruneEmpties = request.QueryString["no-prune"] == null,
+                            IncludeVertexColors = request.QueryString["vertex-colors"] != null,
+                        };
+                        var result = session.ExportGlb(q, outDir, options);
                         WriteJson(context, result.Success ? 200 : 404, new { success = result.Success, message = result.Message, path = result.Path, seconds = result.Seconds });
                         break;
                     case "/mat":
@@ -403,37 +430,46 @@ internal sealed class Session
     }
 
     /// <summary>
-    /// Bundles (not yet loaded) that hold the textures referenced by the export set's materials.
-    /// FileID N in a PPtr indexes the owning collection's dependency table at N-1.
+    /// Bundles (not yet loaded) that hold assets the export set references:
+    /// meshes on skinned renderers, materials, and the materials' textures.
+    /// Generic BFS over FetchDependencies: resolvable references are followed
+    /// (renderer -> material -> texture), unresolvable external ones are mapped
+    /// to their bundle (PPtr FileID N indexes the collection's dependency table
+    /// at N-1). MonoBehaviour references (loot tables, sounds, other prefabs)
+    /// are not chased - they aren't part of the visual model.
     /// </summary>
-    public List<string> FindMissingTextureBundles(IEnumerable<IUnityObjectBase> exportSet)
+    public List<string> FindMissingDependencyBundles(IEnumerable<IUnityObjectBase> exportSet)
     {
         var needed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var renderer in exportSet.OfType<IRenderer>())
+        var visited = new HashSet<IUnityObjectBase>();
+        var queue = new Queue<IUnityObjectBase>(exportSet);
+        while (queue.Count > 0)
         {
-            foreach (var materialPtr in renderer.Materials_C25)
+            var asset = queue.Dequeue();
+            if (!visited.Add(asset) || asset is IMonoBehaviour)
             {
-                if (!materialPtr.TryGetAsset(renderer.Collection, out IMaterial? material))
+                continue;
+            }
+            string[]? deps = null;
+            foreach (var (_, pptr) in asset.FetchDependencies())
+            {
+                if (pptr.PathID == 0)
                 {
                     continue;
                 }
-                string[]? deps = null;
-                foreach (var (_, texEnv) in material.GetTextureProperties())
+                if (asset.Collection.TryGetAsset(pptr.FileID, pptr.PathID) is { } resolved)
                 {
-                    var pptr = texEnv.Texture;
-                    if (pptr.IsNull() || pptr.FileID <= 0 || pptr.TryGetAsset(material.Collection, out _))
-                    {
-                        continue;
-                    }
-                    deps ??= Index.GetDependencies(material.Collection.Name);
-                    if (pptr.FileID - 1 < deps.Length)
-                    {
-                        var cab = deps[pptr.FileID - 1];
-                        if (Index.CabToBundle.TryGetValue(cab, out var bundle))
-                        {
-                            needed.Add(bundle);
-                        }
-                    }
+                    queue.Enqueue(resolved);
+                    continue;
+                }
+                if (pptr.FileID <= 0)
+                {
+                    continue;
+                }
+                deps ??= Index.GetDependencies(asset.Collection.Name);
+                if (pptr.FileID - 1 < deps.Length && Index.CabToBundle.TryGetValue(deps[pptr.FileID - 1], out var bundle))
+                {
+                    needed.Add(bundle);
                 }
             }
         }

@@ -49,12 +49,27 @@ public class RipperMaterialFactory
             ["unity_shader"] = shaderName,
         };
 
+        // Additive shaders (particle glows like animal night-eyes) are not lit
+        // surfaces: closest glTF equivalent is black base + emissive + blend.
+        if (shaderName.Contains("Additive", StringComparison.OrdinalIgnoreCase))
+        {
+            builder.WithBaseColor(new System.Numerics.Vector4(0, 0, 0, 0.35f));
+            builder.WithMetallicRoughness(0f, 1f);
+            builder.WithAlpha(AlphaMode.BLEND);
+            if (TryGetImage(material, "raw", out var glowImage, out var glowName, "_MainTex"))
+            {
+                builder.WithEmissive(glowImage.Value, new System.Numerics.Vector3(1, 1, 1));
+                NameChannelImage(builder, KnownChannel.Emissive, glowName);
+            }
+            return builder;
+        }
+
         var floats = GetFloats(material);
         var colors = GetColors(material);
 
         // --- base color: _MainTex * _Color ---
         var baseColor = colors.TryGetValue("_Color", out var c) ? c : new System.Numerics.Vector4(1, 1, 1, 1);
-        if (TryGetImage(material, "raw", out var mainImage, out var mainName, "_MainTex", "_BaseColorMap", "_AlbedoMap"))
+        if (TryGetImage(material, "raw", out var mainImage, out var mainName, "_MainTex", "_BaseColorMap", "_AlbedoMap", "_Diffuse"))
         {
             builder.WithBaseColor(mainImage.Value, baseColor);
             NameChannelImage(builder, KnownChannel.BaseColor, mainName);
@@ -80,7 +95,7 @@ public class RipperMaterialFactory
             builder.WithMetallicRoughness(mrImage.Value, 1f, 1f);
             NameChannelImage(builder, KnownChannel.MetallicRoughness, mrName);
         }
-        else if (isSpecularWorkflow && TryGetImage(material, "specgloss", out var sgImage, out var sgName, "_SpecGlossMap", "_SpecularMap"))
+        else if (TryGetImage(material, "specgloss", out var sgImage, out var sgName, "_SpecGlossMap", "_SpecularMap", "_Specular"))
         {
             // approximation: gloss alpha becomes roughness, non-metal
             builder.WithMetallicRoughness(sgImage.Value, 0f, 1f);
@@ -93,7 +108,7 @@ public class RipperMaterialFactory
         }
 
         // --- occlusion ---
-        if (TryGetImage(material, "raw", out var occlusionImage, out var occlusionName, "_OcclusionMap"))
+        if (TryGetImage(material, "raw", out var occlusionImage, out var occlusionName, "_OcclusionMap", "_AO"))
         {
             var strength = floats.TryGetValue("_OcclusionStrength", out var os) ? os : 1f;
             builder.WithOcclusion(occlusionImage.Value, strength);
@@ -196,6 +211,7 @@ public class RipperMaterialFactory
 
         pngStream.Position = 0;
         using var img = Image.Load<Rgba32>(pngStream);
+        var normalSource = mode == "normal" ? DetectNormalXSource(img) : NormalXSource.Red;
         img.ProcessPixelRows(accessor =>
         {
             for (var y = 0; y < accessor.Height; y++)
@@ -206,7 +222,7 @@ public class RipperMaterialFactory
                     var p = row[x];
                     row[x] = mode switch
                     {
-                        "normal" => ReconstructNormal(p),
+                        "normal" => ReconstructNormal(p, normalSource),
                         "metalgloss" => new Rgba32(0, (byte)(255 - p.A), p.R, 255),
                         "specgloss" => new Rgba32(0, (byte)(255 - p.A), 0, 255),
                         _ => p,
@@ -219,11 +235,38 @@ public class RipperMaterialFactory
         return new MemoryImage(outStream.ToArray());
     }
 
-    private static Rgba32 ReconstructNormal(Rgba32 p)
+    private enum NormalXSource { Red, Alpha }
+
+    /// <summary>
+    /// Unity stores tangent normals swizzled by format: DXT5nm keeps X in alpha
+    /// (AssetRipper unpacks flagged ones already), BC5 keeps X/Y in R/G with an
+    /// opaque alpha. Decide once per image, not per pixel: a varying alpha
+    /// channel means the X data lives there.
+    /// </summary>
+    private static NormalXSource DetectNormalXSource(Image<Rgba32> img)
     {
-        // Unity stores tangent normals swizzled: DXT5nm keeps X in alpha, BC5 in R/G.
-        // Detect per pixel: a plain RGB normal already has a meaningful blue channel.
-        byte xByte = p.A is 0 or 255 ? p.R : p.A;
+        var alphaVaries = false;
+        img.ProcessPixelRows(accessor =>
+        {
+            for (var y = 0; y < accessor.Height && !alphaVaries; y++)
+            {
+                var row = accessor.GetRowSpan(y);
+                for (var x = 0; x < row.Length; x++)
+                {
+                    if (row[x].A is > 8 and < 247)
+                    {
+                        alphaVaries = true;
+                        break;
+                    }
+                }
+            }
+        });
+        return alphaVaries ? NormalXSource.Alpha : NormalXSource.Red;
+    }
+
+    private static Rgba32 ReconstructNormal(Rgba32 p, NormalXSource source)
+    {
+        byte xByte = source == NormalXSource.Alpha ? p.A : p.R;
         var x = xByte / 255f * 2f - 1f;
         var y = p.G / 255f * 2f - 1f;
         var zSq = 1f - Math.Clamp(x * x + y * y, 0f, 1f);
@@ -233,6 +276,26 @@ public class RipperMaterialFactory
             (byte)((y * 0.5f + 0.5f) * 255),
             (byte)((z * 0.5f + 0.5f) * 255),
             255);
+    }
+
+    /// <summary>Read a single float property off a material (e.g. _ApplyVertexColor).</summary>
+    public static bool TryGetFloat(IMaterial material, string name, out float value)
+    {
+        value = 0f;
+        var sheet = material.SavedProperties_C21;
+        if (!sheet.Has_Floats_AssetDictionary_Utf8String_Single())
+        {
+            return false;
+        }
+        foreach (var pair in sheet.Floats_AssetDictionary_Utf8String_Single)
+        {
+            if (pair.Key.String == name)
+            {
+                value = pair.Value;
+                return true;
+            }
+        }
+        return false;
     }
 
     private static Dictionary<string, float> GetFloats(IMaterial material)

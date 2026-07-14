@@ -32,8 +32,10 @@ public record RipperGlbOptions
     public bool IncludeShadowProxies { get; init; } = false;
     public bool PruneEmpties { get; init; } = true;
 
-    /// <summary>Rust stores shader mask data (wind weights, AO) in vertex colors,
-    /// not tint — glTF viewers multiply COLOR_0 into base color, blackening meshes.</summary>
+    /// <summary>Force COLOR_0 into every mesh. By default vertex colors are only
+    /// exported when a material opts in via _ApplyVertexColor/_ApplyVertexAlpha —
+    /// Rust otherwise uses them for shader masks (wind weights, AO), and glTF
+    /// viewers multiplying COLOR_0 into base color would blacken meshes.</summary>
     public bool IncludeVertexColors { get; init; } = false;
 }
 
@@ -256,10 +258,6 @@ public class RipperGlbBuilder
         }
         if (MeshData.TryMakeFromMesh(mesh, out meshData))
         {
-            if (!options.IncludeVertexColors)
-            {
-                meshData = meshData with { Colors = null };
-            }
             meshCache.Add(mesh, meshData);
             return true;
         }
@@ -284,15 +282,25 @@ public class RipperGlbBuilder
         }
 
         var pairs = new (ISubMesh, MaterialBuilder)[subsetIndices.Length];
+        var vertexColorsAreTint = options.IncludeVertexColors;
         for (var i = 0; i < subsetIndices.Length; i++)
         {
             var material = i < renderer.Materials_C25.Count
                 && renderer.Materials_C25[i].TryGetAsset(renderer.Collection, out AssetRipper.SourceGenerated.Classes.ClassID_21.IMaterial? m)
                 ? m : null;
+            if (material is not null
+                && ((RipperMaterialFactory.TryGetFloat(material, "_ApplyVertexColor", out var avc) && avc != 0f)
+                    || (RipperMaterialFactory.TryGetFloat(material, "_ApplyVertexAlpha", out var ava) && ava != 0f)))
+            {
+                vertexColorsAreTint = true;
+            }
             pairs[i] = (subMeshes[subsetIndices[i]], materials.GetOrMake(material));
         }
+        // Rust materials opt in to vertex-color tint; otherwise COLOR_0 holds
+        // shader masks (wind/AO) that would darken every glTF viewer's shading.
+        var buildData = vertexColorsAreTint ? meshData : meshData with { Colors = null };
         IMeshBuilder<MaterialBuilder> meshBuilder = GlbSubMeshBuilder.BuildSubMeshes(
-            new ArraySegment<(ISubMesh, MaterialBuilder)>(pairs), mesh.Is16BitIndices(), meshData,
+            new ArraySegment<(ISubMesh, MaterialBuilder)>(pairs), mesh.Is16BitIndices(), buildData,
             Transformation.Identity, Transformation.Identity);
         if (meshBuilder is SharpGLTF.BaseBuilder baseBuilder)
         {
