@@ -1,6 +1,6 @@
 using System.Text.RegularExpressions;
 
-namespace PrimeRustExtractor.Core;
+namespace RustRipper.Core;
 
 public record RustInstall(string GameRoot, string BundlesPath, string? BuildId);
 

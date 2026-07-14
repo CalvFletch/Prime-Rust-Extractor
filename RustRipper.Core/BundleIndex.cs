@@ -4,7 +4,7 @@ using AssetRipper.IO.Files.BundleFiles.FileStream;
 using AssetRipper.IO.Files.SerializedFiles;
 using AssetRipper.IO.Files.Streams.Smart;
 
-namespace PrimeRustExtractor.Core;
+namespace RustRipper.Core;
 
 /// <summary>
 /// Header-level index of Rust's bundles: which CAB lives in which bundle, and
@@ -78,7 +78,7 @@ public class BundleIndex
     // ---- persistence ----
 
     private static string CacheDir =>
-        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "PrimeRustExtractor", "bundleindex");
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "RustRipper", "bundleindex");
 
     public static string CachePath(string buildId) => Path.Combine(CacheDir, $"{buildId}.json");
 

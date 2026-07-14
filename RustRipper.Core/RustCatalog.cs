@@ -4,7 +4,7 @@ using AssetRipper.Import.Structure.Assembly.Serializable;
 using AssetRipper.Processing;
 using AssetRipper.SourceGenerated.Classes.ClassID_114;
 
-namespace PrimeRustExtractor.Core;
+namespace RustRipper.Core;
 
 public record CatalogEntry(
     string Kind,          // "item" or "prefab"
@@ -153,7 +153,7 @@ public class RustCatalog
     // ---- persistence (build-id keyed, RAE's lesson) ----
 
     private static string CacheDir =>
-        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "PrimeRustExtractor", "catalog");
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "RustRipper", "catalog");
 
     public static string CachePath(string buildId) => Path.Combine(CacheDir, $"{buildId}.json");
 

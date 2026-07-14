@@ -1,11 +1,11 @@
-﻿
+
 Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
 VisualStudioVersion = 17.0.31903.59
 MinimumVisualStudioVersion = 10.0.40219.1
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "PrimeRustExtractor.Core", "PrimeRustExtractor.Core\PrimeRustExtractor.Core.csproj", "{7A26A615-A8FA-4BCB-83F8-7DC22BC9CF17}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RustRipper.Core", "RustRipper.Core\RustRipper.Core.csproj", "{7A26A615-A8FA-4BCB-83F8-7DC22BC9CF17}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "PrimeRustExtractor.Cli", "PrimeRustExtractor.Cli\PrimeRustExtractor.Cli.csproj", "{7E8F7A34-B2B8-411D-996D-C7CE79137A2F}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RustRipper.Cli", "RustRipper.Cli\RustRipper.Cli.csproj", "{7E8F7A34-B2B8-411D-996D-C7CE79137A2F}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution

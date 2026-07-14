@@ -14,7 +14,7 @@ using AssetRipper.SourceGenerated.Classes.ClassID_114;
 using AssetRipper.SourceGenerated.Classes.ClassID_21;
 using AssetRipper.SourceGenerated.Classes.ClassID_25;
 using AssetRipper.SourceGenerated.Extensions;
-using PrimeRustExtractor.Core;
+using RustRipper.Core;
 
 return args.FirstOrDefault() switch
 {
@@ -32,14 +32,14 @@ internal static class Cli
 {
     public static int Usage()
     {
-        Console.WriteLine("Prime Rust Extractor");
-        Console.WriteLine("  pre detect                                    list Rust installs");
-        Console.WriteLine("  pre catalog [bundle paths...]                 build the object catalog");
-        Console.WriteLine("  pre find <query> [--kind item|prefab] [--category <n>] [--path <s>] [--limit <n>]");
-        Console.WriteLine("  pre export <query> [--out <dir>] [--bundles <extra.bundle>]...");
-        Console.WriteLine("  pre mat <query> [--bundles <extra.bundle>]   per-material shader + properties");
-        Console.WriteLine("  pre serve [--port <n>] [--bundles <extra>]   resident daemon: load once, export instantly");
-        Console.WriteLine("  pre stats <bundle-or-folder> [...]           asset type counts");
+        Console.WriteLine("Rust Ripper");
+        Console.WriteLine("  ripper detect                                    list Rust installs");
+        Console.WriteLine("  ripper catalog [bundle paths...]                 build the object catalog");
+        Console.WriteLine("  ripper find <query> [--kind item|prefab] [--category <n>] [--path <s>] [--limit <n>]");
+        Console.WriteLine("  ripper export <query> [--out <dir>] [--bundles <extra.bundle>]...");
+        Console.WriteLine("  ripper mat <query> [--bundles <extra.bundle>]   per-material shader + properties");
+        Console.WriteLine("  ripper serve [--port <n>] [--bundles <extra>]   resident daemon: load once, export instantly");
+        Console.WriteLine("  ripper stats <bundle-or-folder> [...]           asset type counts");
         return 1;
     }
 
@@ -79,7 +79,7 @@ internal static class Cli
         }
 
         Logger.Add(new ConsoleLogger(false));
-        var handler = new PrimeExportHandler(new FullConfiguration());
+        var handler = new RipperExportHandler(new FullConfiguration());
         var sw = System.Diagnostics.Stopwatch.StartNew();
         GameData gameData = handler.LoadAndProcess(paths, LocalFileSystem.Instance);
         Console.WriteLine($"loaded in {sw.Elapsed.TotalSeconds:F1}s");
@@ -101,7 +101,7 @@ internal static class Cli
     {
         if (args.Length == 0)
         {
-            Console.WriteLine("usage: pre find <query> [--kind item|prefab] [--category <name>] [--path <substr>] [--limit <n>]");
+            Console.WriteLine("usage: ripper find <query> [--kind item|prefab] [--category <name>] [--path <substr>] [--limit <n>]");
             return 1;
         }
 
@@ -123,7 +123,7 @@ internal static class Cli
         var catalog = RustCatalog.LoadNewest();
         if (catalog == null)
         {
-            Console.WriteLine("no catalog found - run: pre catalog");
+            Console.WriteLine("no catalog found - run: ripper catalog");
             return 1;
         }
 
@@ -157,7 +157,7 @@ internal static class Cli
         }
         if (queryParts.Count == 0)
         {
-            Console.WriteLine("usage: pre export <query> [--out <dir>] [--bundles <extra.bundle>]...");
+            Console.WriteLine("usage: ripper export <query> [--out <dir>] [--bundles <extra.bundle>]...");
             return 1;
         }
 
@@ -210,7 +210,7 @@ internal static class Cli
         }
         if (queryParts.Count == 0)
         {
-            Console.WriteLine("usage: pre mat <query> [--bundles <extra.bundle>]");
+            Console.WriteLine("usage: ripper mat <query> [--bundles <extra.bundle>]");
             return 1;
         }
 
@@ -246,7 +246,7 @@ internal static class Cli
         var listener = new HttpListener();
         listener.Prefixes.Add($"http://127.0.0.1:{port}/");
         listener.Start();
-        Console.WriteLine($"PRIME daemon listening on http://127.0.0.1:{port}/  (find /find?q=..., export /export?q=..., materials /mat?q=..., /status)");
+        Console.WriteLine($"Rust Ripper daemon listening on http://127.0.0.1:{port}/  (find /find?q=..., export /export?q=..., materials /mat?q=..., /status)");
 
         while (true)
         {
@@ -308,7 +308,7 @@ internal static class Cli
             return Usage();
         }
         Logger.Add(new ConsoleLogger(false));
-        var handler = new PrimeExportHandler(new FullConfiguration());
+        var handler = new RipperExportHandler(new FullConfiguration());
         var sw = System.Diagnostics.Stopwatch.StartNew();
         GameData gameData = handler.LoadAndProcess(paths, LocalFileSystem.Instance);
         sw.Stop();
@@ -335,9 +335,9 @@ internal static class Cli
 /// Skips assembly/sprite/audio/lighting processing - faster, and avoids a
 /// SpriteProcessor assertion crash when texture bundles are co-loaded.
 /// </summary>
-internal sealed class PrimeExportHandler : ExportHandler
+internal sealed class RipperExportHandler : ExportHandler
 {
-    public PrimeExportHandler(FullConfiguration settings) : base(settings) { }
+    public RipperExportHandler(FullConfiguration settings) : base(settings) { }
 
     protected override IEnumerable<AssetRipper.Processing.IAssetProcessor> GetProcessors()
     {
@@ -366,7 +366,7 @@ internal sealed class Session
         var catalog = RustCatalog.LoadNewest();
         if (catalog == null)
         {
-            Console.WriteLine("no catalog found - run: pre catalog");
+            Console.WriteLine("no catalog found - run: ripper catalog");
             return null;
         }
         var install = RustLocator.GetInstalls().FirstOrDefault();
@@ -382,7 +382,7 @@ internal sealed class Session
             loggerInitialized = true;
         }
         var index = BundleIndex.LoadOrBuild(install.BundlesPath, install.BuildId ?? "unknown");
-        var handler = new PrimeExportHandler(new FullConfiguration());
+        var handler = new RipperExportHandler(new FullConfiguration());
         var sw = System.Diagnostics.Stopwatch.StartNew();
         List<string> loadPaths =
         [
