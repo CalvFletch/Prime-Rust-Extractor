@@ -1,0 +1,3 @@
+[submodule "external/AssetRipper"]
+	path = external/AssetRipper
+	url = https://github.com/AssetRipper/AssetRipper.git
