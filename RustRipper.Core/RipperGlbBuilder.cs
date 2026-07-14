@@ -22,6 +22,7 @@ using AssetRipper.SourceGenerated.Subclasses.SubMesh;
 using SharpGLTF.Geometry;
 using SharpGLTF.Materials;
 using SharpGLTF.Scenes;
+using SharpGLTF.Schema2;
 
 namespace RustRipper.Core;
 
@@ -63,9 +64,11 @@ public class RipperGlbBuilder
     }
 
     public static SceneBuilder Build(IGameObject root, RipperGlbOptions options)
-        => Build(root, options, out _);
+        => Build(root, options, out _, out _);
 
-    public static SceneBuilder Build(IGameObject root, RipperGlbOptions options, out IReadOnlySet<long> vertexColorTintMaterials)
+    public static SceneBuilder Build(IGameObject root, RipperGlbOptions options,
+        out IReadOnlySet<long> vertexColorTintMaterials,
+        out IReadOnlyDictionary<long, System.Numerics.Vector4> detailPaint)
     {
         var builder = new RipperGlbBuilder(options);
         builder.BuildLodMembership(root);
@@ -73,7 +76,41 @@ public class RipperGlbBuilder
         var sceneBuilder = new SceneBuilder();
         builder.AddGameObject(sceneBuilder, null, root.GetTransform());
         vertexColorTintMaterials = builder.vertexColorTintMaterials;
+        detailPaint = builder.materials.DetailPaint;
         return sceneBuilder;
+    }
+
+    /// <summary>
+    /// The "colour attribute method" for detail-layer paint: primitives whose
+    /// material had paint baked also get a flat _RUST_PAINT vertex color
+    /// (the authored _DetailColor). Viewers ignore the custom attribute; in
+    /// Blender it imports as a color attribute the user can grab or rewire.
+    /// </summary>
+    public static void AddPaintAttributes(SharpGLTF.Schema2.ModelRoot model, IReadOnlyDictionary<long, System.Numerics.Vector4> detailPaint)
+    {
+        if (detailPaint.Count == 0)
+        {
+            return;
+        }
+        foreach (var mesh in model.LogicalMeshes)
+        {
+            foreach (var primitive in mesh.Primitives)
+            {
+                var pathId = (primitive.Material?.Extras as JsonObject)?["unity_path_id"]?.GetValue<long>();
+                if (pathId is not { } id || !detailPaint.TryGetValue(id, out var paint))
+                {
+                    continue;
+                }
+                var vertexCount = primitive.GetVertexAccessor("POSITION")?.Count ?? 0;
+                if (vertexCount <= 0)
+                {
+                    continue;
+                }
+                var flat = new System.Numerics.Vector4[vertexCount];
+                Array.Fill(flat, paint);
+                primitive.WithVertexAccessor("_RUST_PAINT", flat);
+            }
+        }
     }
 
     /// <summary>

@@ -598,7 +598,7 @@ internal sealed class Session
         Directory.CreateDirectory(outDir);
         var outPath = System.IO.Path.GetFullPath(System.IO.Path.Combine(outDir, $"{resolved.Value.Name}.glb"));
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        var sceneBuilder = RipperGlbBuilder.Build(resolved.Value.Root, options, out var tintMaterials);
+        var sceneBuilder = RipperGlbBuilder.Build(resolved.Value.Root, options, out var tintMaterials, out var detailPaint);
         bool ok;
         using (var fileStream = File.Create(outPath))
         {
@@ -609,6 +609,7 @@ internal sealed class Session
                 {
                     RipperGlbBuilder.DemoteMaskVertexColors(model, tintMaterials);
                 }
+                RipperGlbBuilder.AddPaintAttributes(model, detailPaint);
                 model.WriteGLB(fileStream);
                 ok = true;
             }
@@ -659,34 +660,37 @@ internal sealed class Session
                         sb.AppendLine($"  {slot.String,-26} {texture.Name.String,-30} DECODE FAILED ({texture.Format_C28E})");
                         continue;
                     }
-                    // DirectBitmap layout is BGRA
-                    var bits = bitmap.Bits;
+                    // channel-true view: same PNG path the material factory consumes
+                    // (DirectBitmap in-memory order varies by source format)
+                    using var pngStream = new MemoryStream();
+                    bitmap.SaveAsPng(pngStream);
+                    pngStream.Position = 0;
+                    using var img = SixLabors.ImageSharp.Image.Load<SixLabors.ImageSharp.PixelFormats.Rgba32>(pngStream);
                     var mins = new byte[] { 255, 255, 255, 255 };
                     var maxs = new byte[4];
                     var sums = new long[4];
                     long count = 0;
-                    double zErrFromRed = 0, zErrFromAlpha = 0;
-                    for (var i = 0; i + 3 < bits.Length; i += 4 * 7)  // sample every 7th pixel
+                    for (var py = 0; py < img.Height; py += 3)
                     {
-                        for (var ch = 0; ch < 4; ch++)
+                        for (var px = 0; px < img.Width; px += 3)
                         {
-                            var v = bits[i + ch];
-                            if (v < mins[ch]) { mins[ch] = v; }
-                            if (v > maxs[ch]) { maxs[ch] = v; }
-                            sums[ch] += v;
+                            var p = img[px, py];
+                            Span<byte> v = [p.R, p.G, p.B, p.A];
+                            for (var ch = 0; ch < 4; ch++)
+                            {
+                                if (v[ch] < mins[ch]) { mins[ch] = v[ch]; }
+                                if (v[ch] > maxs[ch]) { maxs[ch] = v[ch]; }
+                                sums[ch] += v[ch];
+                            }
+                            count++;
                         }
-                        // normal-map self test: which XY source reproduces the stored Z (blue)?
-                        var yN = bits[i + 1] / 255f * 2f - 1f;
-                        zErrFromRed += Math.Abs(bits[i] - PredictZ(bits[i + 2] / 255f * 2f - 1f, yN));
-                        zErrFromAlpha += Math.Abs(bits[i] - PredictZ(bits[i + 3] / 255f * 2f - 1f, yN));
-                        count++;
                     }
-                    string Ch(int bgraIndex) => $"{mins[bgraIndex]}..{maxs[bgraIndex]} ~{(count > 0 ? sums[bgraIndex] / count : 0)}";
+                    string Ch(int i) => $"{mins[i]}..{maxs[i]} ~{(count > 0 ? sums[i] / count : 0)}";
                     sb.AppendLine($"  {slot.String,-26} {texture.Name.String,-30} {texture.Width_C28}x{texture.Height_C28} {texture.Format_C28E}");
-                    sb.AppendLine($"      R {Ch(2),-16} G {Ch(1),-16} B {Ch(0),-16} A {Ch(3)}");
-                    if (count > 0)
+                    sb.AppendLine($"      R {Ch(0),-16} G {Ch(1),-16} B {Ch(2),-16} A {Ch(3)}");
+                    if (slot.String.Contains("Normal", StringComparison.OrdinalIgnoreCase) || slot.String.Contains("Bump", StringComparison.OrdinalIgnoreCase))
                     {
-                        sb.AppendLine($"      normal-Z self test: err(X=R)={zErrFromRed / count:F1} err(X=A)={zErrFromAlpha / count:F1} (small err = that channel is X)");
+                        sb.AppendLine($"      normal layout detected: {RipperMaterialFactory.DetectNormalLayout(img)}");
                     }
                 }
             }

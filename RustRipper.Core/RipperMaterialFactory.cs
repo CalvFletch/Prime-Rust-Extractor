@@ -23,6 +23,9 @@ public class RipperMaterialFactory
     private readonly Dictionary<(ITexture2D, string), MemoryImage?> imageCache = new();
     public MaterialBuilder DefaultMaterial { get; } = new MaterialBuilder("DefaultMaterial");
 
+    /// <summary>Materials whose detail-layer paint was baked: PathID -> _DetailColor (as authored, sRGB).</summary>
+    public Dictionary<long, System.Numerics.Vector4> DetailPaint { get; } = new();
+
     public MaterialBuilder GetOrMake(IMaterial? material)
     {
         if (material is null)
@@ -136,6 +139,7 @@ public class RipperMaterialFactory
             {
                 builder.WithBaseColor(tintedImage.Value, baseColor);
                 NameChannelImage(builder, KnownChannel.BaseColor, diffuseTexture.Name.String);
+                DetailPaint[material.PathID] = dc;
                 baseColorSet = true;
             }
         }
@@ -455,7 +459,7 @@ public class RipperMaterialFactory
 
         pngStream.Position = 0;
         using var img = Image.Load<Rgba32>(pngStream);
-        var normalSource = baseMode == "normal" ? DetectNormalXSource(img) : NormalXSource.Red;
+        var normalSource = baseMode == "normal" ? DetectNormalLayout(img) : NormalLayout.XRed_ZBlue;
         img.ProcessPixelRows(accessor =>
         {
             for (var y = 0; y < accessor.Height; y++)
@@ -485,42 +489,65 @@ public class RipperMaterialFactory
     private static byte Roughness(byte smoothness, float scale)
         => (byte)Math.Clamp(255f - smoothness * scale, 0f, 255f);
 
-    private enum NormalXSource { Red, Alpha }
+    public enum NormalLayout
+    {
+        XRed_ZBlue,   // plain RGB tangent normal
+        XAlpha_ZBlue, // classic DXT5nm swizzle, never unpacked
+        XBlue_ZRed,   // engine's UnpackNormal output for RGBA-layout formats (BC7):
+                      // it writes with BGRA indices, landing Z in red and X in blue
+    }
 
     /// <summary>
-    /// Unity stores tangent normals swizzled by format: DXT5nm keeps X in alpha
-    /// with a CONSTANT red channel; BC5/plain keep X in red. Decide once per
-    /// image: only a flat red channel plus a varying alpha means DXT5nm — a
-    /// varying alpha alone can be unrelated packed data riding in A.
+    /// Pick the channel layout that is self-consistent: a real tangent normal
+    /// satisfies z = sqrt(1 - x^2 - y^2), so the candidate whose XY best
+    /// reproduces the stored Z channel is the true layout. Decided once per
+    /// image from sampled pixels — no format flags, no trust in upstream
+    /// unpacking order.
     /// </summary>
-    private static NormalXSource DetectNormalXSource(Image<Rgba32> img)
+    public static NormalLayout DetectNormalLayout(Image<Rgba32> img)
     {
-        byte rMin = 255, rMax = 0;
-        var alphaVaries = false;
+        double errXRed = 0, errXAlpha = 0, errXBlue = 0;
+        long count = 0;
         img.ProcessPixelRows(accessor =>
         {
-            for (var y = 0; y < accessor.Height; y++)
+            for (var y = 0; y < accessor.Height; y += 4)
             {
                 var row = accessor.GetRowSpan(y);
-                for (var x = 0; x < row.Length; x++)
+                for (var x = 0; x < row.Length; x += 4)
                 {
                     var p = row[x];
-                    if (p.R < rMin) { rMin = p.R; }
-                    if (p.R > rMax) { rMax = p.R; }
-                    if (p.A is > 8 and < 247)
-                    {
-                        alphaVaries = true;
-                    }
+                    var yN = p.G / 255f * 2f - 1f;
+                    errXRed += Math.Abs(p.B - PredictZByte(p.R / 255f * 2f - 1f, yN));
+                    errXAlpha += Math.Abs(p.B - PredictZByte(p.A / 255f * 2f - 1f, yN));
+                    errXBlue += Math.Abs(p.R - PredictZByte(p.B / 255f * 2f - 1f, yN));
+                    count++;
                 }
             }
         });
-        var redIsFlat = rMax - rMin <= 24;
-        return redIsFlat && alphaVaries ? NormalXSource.Alpha : NormalXSource.Red;
+        if (count == 0)
+        {
+            return NormalLayout.XRed_ZBlue;
+        }
+        var best = Math.Min(errXRed, Math.Min(errXAlpha, errXBlue));
+        return best == errXBlue ? NormalLayout.XBlue_ZRed
+            : best == errXAlpha ? NormalLayout.XAlpha_ZBlue
+            : NormalLayout.XRed_ZBlue;
     }
 
-    private static Rgba32 ReconstructNormal(Rgba32 p, NormalXSource source)
+    private static float PredictZByte(float x, float y)
     {
-        byte xByte = source == NormalXSource.Alpha ? p.A : p.R;
+        var zSq = 1f - Math.Clamp(x * x + y * y, 0f, 1f);
+        return (MathF.Sqrt(zSq) + 1f) / 2f * 255f;
+    }
+
+    private static Rgba32 ReconstructNormal(Rgba32 p, NormalLayout layout)
+    {
+        byte xByte = layout switch
+        {
+            NormalLayout.XAlpha_ZBlue => p.A,
+            NormalLayout.XBlue_ZRed => p.B,
+            _ => p.R,
+        };
         var x = xByte / 255f * 2f - 1f;
         var y = p.G / 255f * 2f - 1f;
         var zSq = 1f - Math.Clamp(x * x + y * y, 0f, 1f);
