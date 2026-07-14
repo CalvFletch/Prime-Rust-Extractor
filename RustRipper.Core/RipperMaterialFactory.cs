@@ -92,12 +92,20 @@ public class RipperMaterialFactory
         }
 
         // --- base color: _MainTex * _Color ---
+        // Unity serializes material colors as sRGB; glTF factors are linear.
         // Fur shells (AnimalFur) keep their density mask in _FuzzMask: composite
         // it into the diffuse alpha and blend, or the shell renders as an
         // opaque second skin over the body.
-        var baseColor = colors.TryGetValue("_Color", out var c) ? c : new System.Numerics.Vector4(1, 1, 1, 1);
+        // The detail layer is Rust's paint system (barrels: _DetailMask marks
+        // the painted band, _DetailColor is the paint) - baked into the albedo.
+        var baseColor = SrgbToLinearFactor(colors.TryGetValue("_Color", out var c) ? c : new System.Numerics.Vector4(1, 1, 1, 1));
         var fuzzTexture = GetTexture(material, "_FuzzMask");
         var diffuseTexture = GetTexture(material, "_MainTex", "_BaseColorMap", "_AlbedoMap", "_Diffuse");
+        var detailMask = GetTexture(material, "_DetailMask");
+        var detailTintActive = floats.TryGetValue("_DetailLayer", out var detailLayer) && detailLayer != 0f
+            && detailMask is not null
+            && GetTexture(material, "_DetailAlbedoMap") is null
+            && colors.TryGetValue("_DetailColor", out var detailColor);
         var baseColorSet = false;
         if (fuzzTexture is not null && diffuseTexture is not null)
         {
@@ -112,6 +120,22 @@ public class RipperMaterialFactory
                 builder.WithBaseColor(furImage.Value, baseColor);
                 NameChannelImage(builder, KnownChannel.BaseColor, diffuseTexture.Name.String);
                 builder.WithAlpha(AlphaMode.BLEND);
+                baseColorSet = true;
+            }
+        }
+        if (!baseColorSet && detailTintActive && diffuseTexture is not null)
+        {
+            colors.TryGetValue("_DetailColor", out var dc);
+            var key = (diffuseTexture, $"detailtint:{detailMask!.PathID}:{dc.X:F3}:{dc.Y:F3}:{dc.Z:F3}");
+            if (!imageCache.TryGetValue(key, out var tintedImage))
+            {
+                tintedImage = DecodeDetailTint(diffuseTexture, detailMask, dc);
+                imageCache.Add(key, tintedImage);
+            }
+            if (tintedImage is not null)
+            {
+                builder.WithBaseColor(tintedImage.Value, baseColor);
+                NameChannelImage(builder, KnownChannel.BaseColor, diffuseTexture.Name.String);
                 baseColorSet = true;
             }
         }
@@ -285,6 +309,82 @@ public class RipperMaterialFactory
             }
         }
         return null;
+    }
+
+    /// <summary>Unity color properties are sRGB; glTF color factors are linear.</summary>
+    private static System.Numerics.Vector4 SrgbToLinearFactor(System.Numerics.Vector4 srgb)
+        => new(MathF.Pow(srgb.X, 2.2f), MathF.Pow(srgb.Y, 2.2f), MathF.Pow(srgb.Z, 2.2f), srgb.W);
+
+    /// <summary>
+    /// Bake Rust's detail-layer paint into the albedo: where the mask says
+    /// painted, multiply the albedo by _DetailColor (in linear space, like the
+    /// shader). This is how barrels get their red/blue/brown bands.
+    /// </summary>
+    private static MemoryImage? DecodeDetailTint(ITexture2D diffuseTexture, ITexture2D maskTexture, System.Numerics.Vector4 detailColor)
+    {
+        if (!TextureConverter.TryConvertToBitmap(diffuseTexture, out DirectBitmap diffuseBitmap)
+            || !TextureConverter.TryConvertToBitmap(maskTexture, out DirectBitmap maskBitmap))
+        {
+            return null;
+        }
+        using var diffuseStream = new MemoryStream();
+        diffuseBitmap.SaveAsPng(diffuseStream);
+        diffuseStream.Position = 0;
+        using var maskStream = new MemoryStream();
+        maskBitmap.SaveAsPng(maskStream);
+        maskStream.Position = 0;
+
+        using var diffuse = Image.Load<Rgba32>(diffuseStream);
+        using var mask = Image.Load<Rgba32>(maskStream);
+        if (mask.Width != diffuse.Width || mask.Height != diffuse.Height)
+        {
+            mask.Mutate(x => x.Resize(diffuse.Width, diffuse.Height));
+        }
+
+        // mask channel: alpha when it carries data (Unity's convention is
+        // mask.a), red otherwise (single-channel formats decode into red)
+        var alphaVaries = false;
+        for (var y = 0; y < mask.Height && !alphaVaries; y += 8)
+        {
+            for (var x = 0; x < mask.Width; x += 8)
+            {
+                if (mask[x, y].A is > 8 and < 247)
+                {
+                    alphaVaries = true;
+                    break;
+                }
+            }
+        }
+
+        var tintR = MathF.Pow(detailColor.X, 2.2f);
+        var tintG = MathF.Pow(detailColor.Y, 2.2f);
+        var tintB = MathF.Pow(detailColor.Z, 2.2f);
+        for (var y = 0; y < diffuse.Height; y++)
+        {
+            for (var x = 0; x < diffuse.Width; x++)
+            {
+                var p = diffuse[x, y];
+                var m = (alphaVaries ? mask[x, y].A : mask[x, y].R) / 255f;
+                if (m <= 0f)
+                {
+                    continue;
+                }
+                var r = MathF.Pow(p.R / 255f, 2.2f);
+                var g = MathF.Pow(p.G / 255f, 2.2f);
+                var b = MathF.Pow(p.B / 255f, 2.2f);
+                r += (r * tintR - r) * m;
+                g += (g * tintG - g) * m;
+                b += (b * tintB - b) * m;
+                diffuse[x, y] = new Rgba32(
+                    (byte)(MathF.Pow(r, 1f / 2.2f) * 255f),
+                    (byte)(MathF.Pow(g, 1f / 2.2f) * 255f),
+                    (byte)(MathF.Pow(b, 1f / 2.2f) * 255f),
+                    p.A);
+            }
+        }
+        using var outStream = new MemoryStream();
+        diffuse.SaveAsPng(outStream);
+        return new MemoryImage(outStream.ToArray());
     }
 
     /// <summary>Diffuse RGB with the fuzz mask's red channel as alpha (fur shell density).</summary>
