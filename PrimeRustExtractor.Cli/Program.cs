@@ -1,32 +1,203 @@
 using AssetRipper.Export.UnityProjects;
-using AssetRipper.Export.UnityProjects.Configuration;
+using AssetRipper.Export.Configuration;
+using AssetRipper.IO.Files;
 using AssetRipper.Import.Logging;
 using AssetRipper.Import.Structure.Assembly;
 using AssetRipper.Import.Structure.Assembly.Serializable;
 using AssetRipper.Processing;
 using AssetRipper.SourceGenerated.Classes.ClassID_114;
+using PrimeRustExtractor.Core;
 
-if (args.Length == 0)
+return args.FirstOrDefault() switch
 {
-    Console.WriteLine("usage:");
-    Console.WriteLine("  pre stats <bundle-or-folder> [more paths...]   asset type counts");
-    Console.WriteLine("  pre items <bundle-or-folder> [more paths...]   ItemDefinition catalog scan");
+    "detect" => Detect(),
+    "catalog" => Catalog(args[1..]),
+    "find" => Find(args[1..]),
+    "stats" => Stats(args[1..]),
+    "probe" => Probe(args[1..]),
+    _ => Usage(),
+};
+
+static int Probe(string[] paths)
+{
+    Logger.Add(new ConsoleLogger(false));
+    var handler = new ExportHandler(new FullConfiguration());
+    GameData gameData = handler.LoadAndProcess(paths, LocalFileSystem.Instance);
+
+    var scriptNames = new Dictionary<string, int>();
+    var total = 0;
+    foreach (var asset in gameData.GameBundle.FetchAssets())
+    {
+        total++;
+        if (asset is IMonoBehaviour mb)
+        {
+            var cls = mb.ScriptP?.ClassName_R.String ?? "(unresolved script)";
+            scriptNames[cls] = scriptNames.GetValueOrDefault(cls) + 1;
+            if ((mb.Name.String ?? "").Contains("manifest", StringComparison.OrdinalIgnoreCase))
+            {
+                Console.WriteLine($"named-manifest asset: name='{mb.Name.String}' scriptClass='{cls}' pathid={mb.PathID}");
+            }
+        }
+    }
+    Console.WriteLine($"total assets: {total}");
+    foreach (var collection in gameData.GameBundle.FetchAssetCollections().OrderByDescending(c => c.Count).Take(15))
+    {
+        Console.WriteLine($"{collection.Count,8}  collection: {collection.Name}");
+    }
+    void DumpBundle(AssetRipper.Assets.Bundles.Bundle bundle, int depth)
+    {
+        var pad = new string(' ', depth * 4);
+        Console.WriteLine($"{pad}bundle: {bundle.Name} ({bundle.GetType().Name})");
+        foreach (var collection in bundle.Collections)
+        {
+            Console.WriteLine($"{pad}    collection: {collection.Name} ({collection.Count})");
+        }
+        foreach (var resource in bundle.Resources)
+        {
+            Console.WriteLine($"{pad}    resource: {resource.Name}");
+        }
+        foreach (var failed in bundle.FailedFiles)
+        {
+            Console.WriteLine($"{pad}    FAILED: {failed.Name}");
+            Console.WriteLine($"{pad}    {failed.StackTrace[..Math.Min(900, failed.StackTrace.Length)]}");
+        }
+        foreach (var child in bundle.Bundles)
+        {
+            DumpBundle(child, depth + 1);
+        }
+    }
+    DumpBundle(gameData.GameBundle, 0);
+    foreach (var (cls, count) in scriptNames.OrderByDescending(x => x.Value).Take(12))
+    {
+        Console.WriteLine($"{count,8}  {cls}");
+    }
+    var manifestish = scriptNames.Keys.Where(k => k.Contains("anifest", StringComparison.Ordinal)).ToList();
+    Console.WriteLine("manifest-like script classes: " + (manifestish.Count > 0 ? string.Join(", ", manifestish) : "(none)"));
+    return 0;
+}
+
+static int Usage()
+{
+    Console.WriteLine("Prime Rust Extractor");
+    Console.WriteLine("  pre detect                                     list Rust installs");
+    Console.WriteLine("  pre catalog [bundle paths...]                  build the object catalog (auto-detects install if no paths)");
+    Console.WriteLine("  pre find <query> [--kind item|prefab]          search the catalog");
+    Console.WriteLine("           [--category <name>] [--path <substr>] [--limit <n>]");
+    Console.WriteLine("  pre stats <bundle-or-folder> [...]             asset type counts");
     return 1;
 }
 
-var command = args[0] is "stats" or "items" ? args[0] : "stats";
-var paths = args[0] is "stats" or "items" ? args[1..] : args;
-
-Logger.Add(new ConsoleLogger(false));
-
-var handler = new ExportHandler(new LibraryConfiguration());
-var sw = System.Diagnostics.Stopwatch.StartNew();
-GameData gameData = handler.LoadAndProcess(paths);
-sw.Stop();
-Console.WriteLine($"\nloaded in {sw.Elapsed.TotalSeconds:F1}s");
-
-if (command == "stats")
+static int Detect()
 {
+    var installs = RustLocator.GetInstalls();
+    foreach (var install in installs)
+    {
+        Console.WriteLine($"Rust [B: {install.BuildId ?? "?"}] {install.GameRoot}");
+    }
+    if (installs.Count == 0)
+    {
+        Console.WriteLine("no Rust installs found");
+        return 1;
+    }
+    return 0;
+}
+
+static int Catalog(string[] paths)
+{
+    string buildId = "manual";
+    if (paths.Length == 0)
+    {
+        var install = RustLocator.GetInstalls().FirstOrDefault();
+        if (install == null)
+        {
+            Console.WriteLine("no Rust install detected; pass bundle paths explicitly");
+            return 1;
+        }
+        buildId = install.BuildId ?? "unknown";
+        paths =
+        [
+            Path.Combine(install.BundlesPath, "shared", "items.preload.bundle"),
+            Path.Combine(install.BundlesPath, "shared", "content.bundle"),
+        ];
+        Console.WriteLine($"install: {install.GameRoot} (build {buildId})");
+    }
+
+    Logger.Add(new ConsoleLogger(false));
+    var handler = new ExportHandler(new FullConfiguration());
+    var sw = System.Diagnostics.Stopwatch.StartNew();
+    GameData gameData = handler.LoadAndProcess(paths, LocalFileSystem.Instance);
+    Console.WriteLine($"loaded in {sw.Elapsed.TotalSeconds:F1}s");
+
+    sw.Restart();
+    var catalog = RustCatalog.Build(gameData, buildId);
+    catalog.Save();
+    sw.Stop();
+
+    var items = catalog.Entries.Count(e => e.Kind == "item");
+    var prefabs = catalog.Entries.Count(e => e.Kind == "prefab");
+    var joined = catalog.Entries.Count(e => e.Kind == "item" && e.PrefabPath.Length > 0);
+    Console.WriteLine($"catalog built in {sw.Elapsed.TotalSeconds:F1}s: {items} items ({joined} with prefab paths), {prefabs} prefabs");
+    Console.WriteLine($"saved: {RustCatalog.CachePath(buildId)}");
+    return 0;
+}
+
+static int Find(string[] args)
+{
+    if (args.Length == 0)
+    {
+        Console.WriteLine("usage: pre find <query> [--kind item|prefab] [--category <name>] [--path <substr>] [--limit <n>]");
+        return 1;
+    }
+
+    var queryParts = new List<string>();
+    string? kind = null, category = null, pathContains = null;
+    var limit = 25;
+    for (var i = 0; i < args.Length; i++)
+    {
+        switch (args[i])
+        {
+            case "--kind": kind = args[++i]; break;
+            case "--category": category = args[++i]; break;
+            case "--path": pathContains = args[++i]; break;
+            case "--limit": limit = int.Parse(args[++i]); break;
+            default: queryParts.Add(args[i]); break;
+        }
+    }
+
+    var catalog = RustCatalog.LoadNewest();
+    if (catalog == null)
+    {
+        Console.WriteLine("no catalog found - run: pre catalog");
+        return 1;
+    }
+
+    var shown = 0;
+    foreach (var entry in catalog.Find(string.Join(' ', queryParts), kind, category, pathContains))
+    {
+        Console.WriteLine($"[{entry.Kind,-6}] {entry.Name,-38} {entry.ShortName,-30} {entry.Category,-12} {entry.PrefabPath}");
+        if (++shown >= limit)
+        {
+            Console.WriteLine("... (more; raise --limit or refine the query)");
+            break;
+        }
+    }
+    Console.WriteLine($"=== {shown} shown (catalog build {catalog.BuildId}, {catalog.Entries.Count} entries) ===");
+    return 0;
+}
+
+static int Stats(string[] paths)
+{
+    if (paths.Length == 0)
+    {
+        return Usage();
+    }
+    Logger.Add(new ConsoleLogger(false));
+    var handler = new ExportHandler(new FullConfiguration());
+    var sw = System.Diagnostics.Stopwatch.StartNew();
+    GameData gameData = handler.LoadAndProcess(paths, LocalFileSystem.Instance);
+    sw.Stop();
+    Console.WriteLine($"loaded in {sw.Elapsed.TotalSeconds:F1}s");
+
     var counts = new Dictionary<string, int>();
     var total = 0;
     foreach (var asset in gameData.GameBundle.FetchAssets())
@@ -41,42 +212,3 @@ if (command == "stats")
     }
     return 0;
 }
-
-// items: scan for ItemDefinition MonoBehaviours and read player-facing fields
-var found = 0;
-foreach (var asset in gameData.GameBundle.FetchAssets())
-{
-    if (asset is not IMonoBehaviour monoBehaviour)
-    {
-        continue;
-    }
-    if (monoBehaviour.ScriptP?.ClassName_R.String != "ItemDefinition")
-    {
-        continue;
-    }
-
-    SerializableStructure? structure = monoBehaviour.LoadStructure();
-    if (structure is null)
-    {
-        continue;
-    }
-
-    var shortname = structure.TryGetField("shortname")?.AsString ?? "?";
-    var itemid = structure.TryGetField("itemid") is { } id ? id.PValue : 0;
-    var english = "?";
-    if (structure.TryGetField("displayName") is { } dn && dn.CValue is SerializableStructure phrase)
-    {
-        // Rust's Translate.Phrase: current builds use "legacyEnglish", older ones "english"
-        english = phrase.TryGetField("legacyEnglish")?.AsString
-            ?? phrase.TryGetField("english")?.AsString
-            ?? "?";
-    }
-
-    if (found < 20)
-    {
-        Console.WriteLine($"{itemid,12}  {shortname,-28}  {english}");
-    }
-    found++;
-}
-Console.WriteLine($"=== {found} ItemDefinitions found ===");
-return 0;
