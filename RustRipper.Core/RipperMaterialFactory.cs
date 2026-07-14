@@ -8,6 +8,7 @@ using SharpGLTF.Materials;
 using SharpGLTF.Memory;
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.PixelFormats;
+using SixLabors.ImageSharp.Processing;
 
 namespace RustRipper.Core;
 
@@ -68,13 +69,36 @@ public class RipperMaterialFactory
         var colors = GetColors(material);
 
         // --- base color: _MainTex * _Color ---
+        // Fur shells (AnimalFur) keep their density mask in _FuzzMask: composite
+        // it into the diffuse alpha and blend, or the shell renders as an
+        // opaque second skin over the body.
         var baseColor = colors.TryGetValue("_Color", out var c) ? c : new System.Numerics.Vector4(1, 1, 1, 1);
-        if (TryGetImage(material, "raw", out var mainImage, out var mainName, "_MainTex", "_BaseColorMap", "_AlbedoMap", "_Diffuse"))
+        var fuzzTexture = GetTexture(material, "_FuzzMask");
+        var diffuseTexture = GetTexture(material, "_MainTex", "_BaseColorMap", "_AlbedoMap", "_Diffuse");
+        var baseColorSet = false;
+        if (fuzzTexture is not null && diffuseTexture is not null)
+        {
+            var key = (diffuseTexture, "difffuzz");
+            if (!imageCache.TryGetValue(key, out var furImage))
+            {
+                furImage = DecodeDiffuseWithFuzzAlpha(diffuseTexture, fuzzTexture);
+                imageCache.Add(key, furImage);
+            }
+            if (furImage is not null)
+            {
+                builder.WithBaseColor(furImage.Value, baseColor);
+                NameChannelImage(builder, KnownChannel.BaseColor, diffuseTexture.Name.String);
+                builder.WithAlpha(AlphaMode.BLEND);
+                baseColorSet = true;
+            }
+        }
+        if (!baseColorSet && TryGetImage(material, "raw", out var mainImage, out var mainName, "_MainTex", "_BaseColorMap", "_AlbedoMap", "_Diffuse"))
         {
             builder.WithBaseColor(mainImage.Value, baseColor);
             NameChannelImage(builder, KnownChannel.BaseColor, mainName);
+            baseColorSet = true;
         }
-        else
+        if (!baseColorSet)
         {
             builder.WithBaseColor(baseColor);
         }
@@ -194,6 +218,54 @@ public class RipperMaterialFactory
             }
         }
         return false;
+    }
+
+    private static ITexture2D? GetTexture(IMaterial material, params string[] slotNames)
+    {
+        foreach (var slot in slotNames)
+        {
+            if (material.TryGetTextureProperty(slot, out var texEnv)
+                && texEnv.Texture.TryGetAsset(material.Collection) is ITexture2D texture)
+            {
+                return texture;
+            }
+        }
+        return null;
+    }
+
+    /// <summary>Diffuse RGB with the fuzz mask's red channel as alpha (fur shell density).</summary>
+    private static MemoryImage? DecodeDiffuseWithFuzzAlpha(ITexture2D diffuseTexture, ITexture2D fuzzTexture)
+    {
+        if (!TextureConverter.TryConvertToBitmap(diffuseTexture, out DirectBitmap diffuseBitmap)
+            || !TextureConverter.TryConvertToBitmap(fuzzTexture, out DirectBitmap fuzzBitmap))
+        {
+            return null;
+        }
+        using var diffuseStream = new MemoryStream();
+        diffuseBitmap.SaveAsPng(diffuseStream);
+        diffuseStream.Position = 0;
+        using var fuzzStream = new MemoryStream();
+        fuzzBitmap.SaveAsPng(fuzzStream);
+        fuzzStream.Position = 0;
+
+        using var diffuse = Image.Load<Rgba32>(diffuseStream);
+        using var fuzz = Image.Load<Rgba32>(fuzzStream);
+        if (fuzz.Width != diffuse.Width || fuzz.Height != diffuse.Height)
+        {
+            fuzz.Mutate(x => x.Resize(diffuse.Width, diffuse.Height));
+        }
+        for (var y = 0; y < diffuse.Height; y++)
+        {
+            for (var x = 0; x < diffuse.Width; x++)
+            {
+                var p = diffuse[x, y];
+                p.A = fuzz[x, y].R;
+                diffuse[x, y] = p;
+            }
+        }
+        using var outStream = new MemoryStream();
+        diffuse.SaveAsPng(outStream);
+        return new MemoryImage(outStream.ToArray());
     }
 
     private static MemoryImage? Decode(ITexture2D texture, string mode)

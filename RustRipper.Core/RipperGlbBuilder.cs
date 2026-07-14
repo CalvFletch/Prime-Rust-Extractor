@@ -55,6 +55,7 @@ public class RipperGlbBuilder
     private readonly Dictionary<IMesh, MeshData> meshCache = new();
     private readonly Dictionary<IRenderer, (int Level, bool ShadowOnly)> lodMembership = new();
     private readonly HashSet<IGameObject> keep = new();
+    private readonly HashSet<long> vertexColorTintMaterials = new();
 
     private RipperGlbBuilder(RipperGlbOptions options)
     {
@@ -62,13 +63,45 @@ public class RipperGlbBuilder
     }
 
     public static SceneBuilder Build(IGameObject root, RipperGlbOptions options)
+        => Build(root, options, out _);
+
+    public static SceneBuilder Build(IGameObject root, RipperGlbOptions options, out IReadOnlySet<long> vertexColorTintMaterials)
     {
         var builder = new RipperGlbBuilder(options);
         builder.BuildLodMembership(root);
         builder.BuildKeepSet(root);
         var sceneBuilder = new SceneBuilder();
         builder.AddGameObject(sceneBuilder, null, root.GetTransform());
+        vertexColorTintMaterials = builder.vertexColorTintMaterials;
         return sceneBuilder;
+    }
+
+    /// <summary>
+    /// Vertex colors are always exported so the data survives, but COLOR_0
+    /// multiplies into base color per the glTF spec — correct only for
+    /// materials that opt in via _ApplyVertexColor. For everything else the
+    /// attribute is renamed to _RUST_COLOR: Blender still imports it as a mesh
+    /// attribute (masks stay available), viewers stop darkening the shading.
+    /// </summary>
+    public static void DemoteMaskVertexColors(SharpGLTF.Schema2.ModelRoot model, IReadOnlySet<long> tintMaterials)
+    {
+        foreach (var mesh in model.LogicalMeshes)
+        {
+            foreach (var primitive in mesh.Primitives)
+            {
+                if (primitive.GetVertexAccessor("COLOR_0") is not { } colors)
+                {
+                    continue;
+                }
+                var pathId = (primitive.Material?.Extras as JsonObject)?["unity_path_id"]?.GetValue<long>();
+                if (pathId is { } id && tintMaterials.Contains(id))
+                {
+                    continue;
+                }
+                primitive.SetVertexAccessor("COLOR_0", null);
+                primitive.SetVertexAccessor("_RUST_COLOR", colors);
+            }
+        }
     }
 
     // ---- decision data ----
@@ -282,7 +315,6 @@ public class RipperGlbBuilder
         }
 
         var pairs = new (ISubMesh, MaterialBuilder)[subsetIndices.Length];
-        var vertexColorsAreTint = options.IncludeVertexColors;
         for (var i = 0; i < subsetIndices.Length; i++)
         {
             var material = i < renderer.Materials_C25.Count
@@ -292,15 +324,12 @@ public class RipperGlbBuilder
                 && ((RipperMaterialFactory.TryGetFloat(material, "_ApplyVertexColor", out var avc) && avc != 0f)
                     || (RipperMaterialFactory.TryGetFloat(material, "_ApplyVertexAlpha", out var ava) && ava != 0f)))
             {
-                vertexColorsAreTint = true;
+                vertexColorTintMaterials.Add(material.PathID);
             }
             pairs[i] = (subMeshes[subsetIndices[i]], materials.GetOrMake(material));
         }
-        // Rust materials opt in to vertex-color tint; otherwise COLOR_0 holds
-        // shader masks (wind/AO) that would darken every glTF viewer's shading.
-        var buildData = vertexColorsAreTint ? meshData : meshData with { Colors = null };
         IMeshBuilder<MaterialBuilder> meshBuilder = GlbSubMeshBuilder.BuildSubMeshes(
-            new ArraySegment<(ISubMesh, MaterialBuilder)>(pairs), mesh.Is16BitIndices(), buildData,
+            new ArraySegment<(ISubMesh, MaterialBuilder)>(pairs), mesh.Is16BitIndices(), meshData,
             Transformation.Identity, Transformation.Identity);
         if (meshBuilder is SharpGLTF.BaseBuilder baseBuilder)
         {

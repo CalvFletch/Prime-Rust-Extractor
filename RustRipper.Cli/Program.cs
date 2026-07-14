@@ -560,14 +560,24 @@ internal sealed class Session
         Directory.CreateDirectory(outDir);
         var outPath = System.IO.Path.GetFullPath(System.IO.Path.Combine(outDir, $"{resolved.Value.Name}.glb"));
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        var sceneBuilder = RipperGlbBuilder.Build(resolved.Value.Root, options);
+        var sceneBuilder = RipperGlbBuilder.Build(resolved.Value.Root, options, out var tintMaterials);
         bool ok;
         using (var fileStream = File.Create(outPath))
         {
-            ok = AssetRipper.Export.Modules.Models.GlbWriter.TryWrite(sceneBuilder, fileStream, out string? glbError);
-            if (!ok)
+            try
             {
-                Logger.Error(glbError ?? "GLB write failed");
+                var model = sceneBuilder.ToGltf2();
+                if (!options.IncludeVertexColors)
+                {
+                    RipperGlbBuilder.DemoteMaskVertexColors(model, tintMaterials);
+                }
+                model.WriteGLB(fileStream);
+                ok = true;
+            }
+            catch (Exception ex)
+            {
+                Logger.Error($"GLB write failed: {ex.Message}");
+                ok = false;
             }
         }
         sw.Stop();
