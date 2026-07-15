@@ -59,6 +59,10 @@ public record RipperGlbOptions
     /// unity_hidden so it imports hidden. Off keeps it visible; disabled
     /// renderers and inactive objects are always flagged.</summary>
     public bool HideUtility { get; init; } = true;
+
+    /// <summary>GameObject PathIDs kept even without content (e.g. vehicle
+    /// module socket transforms read from the chassis data).</summary>
+    public IReadOnlySet<long> ForceKeepPathIds { get; init; } = new HashSet<long>();
 }
 
 /// <summary>
@@ -97,6 +101,7 @@ public class RipperGlbBuilder
         builder = new RipperGlbBuilder(options);
         builder.BuildLodMembership(root);
         builder.BuildNameConventionLodMembership(root);
+        builder.BuildHiddenStateVariants(root);
         builder.BuildKeepSet(root);
         var sceneBuilder = new SceneBuilder();
         builder.AddGameObject(sceneBuilder, null, root.GetTransform());
@@ -313,7 +318,42 @@ public class RipperGlbBuilder
 
     private bool Contributes(IGameObject gameObject)
         => EmitsGeometry(gameObject)
-        || (options.IncludeLights && gameObject.TryGetComponent(out ILight? _));
+        || (options.IncludeLights && gameObject.TryGetComponent(out ILight? _))
+        || options.ForceKeepPathIds.Contains(gameObject.PathID);
+
+    /// <summary>
+    /// State-variant components declare which child subtrees are alternate
+    /// runtime states (locked/unlocked/blocked keypads...). The non-default
+    /// states export hidden - present, togglable, not cluttering the view.
+    /// Read from the components' own serialized fields, per class.
+    /// </summary>
+    private static readonly Dictionary<string, string[]> HiddenStateFields = new()
+    {
+        ["ModularCarCodeLockVisuals"] = ["unlockedVisuals", "blockedVisuals"],
+    };
+
+    private readonly HashSet<long> hiddenStateRoots = new();
+
+    private void BuildHiddenStateVariants(IGameObject root)
+    {
+        foreach (var monoBehaviour in root.FetchHierarchy().OfType<IMonoBehaviour>())
+        {
+            if (monoBehaviour.ScriptP?.ClassName_R.String is not { } className
+                || !HiddenStateFields.TryGetValue(className, out var fields)
+                || monoBehaviour.LoadStructure() is not { } structure)
+            {
+                continue;
+            }
+            foreach (var fieldName in fields)
+            {
+                if (structure.TryGetField(fieldName) is { CValue: AssetRipper.Assets.Metadata.IPPtr pptr }
+                    && monoBehaviour.Collection.TryGetAsset(pptr.FileID, pptr.PathID) is IGameObject target)
+                {
+                    hiddenStateRoots.Add(target.PathID);
+                }
+            }
+        }
+    }
 
     private bool EmitsGeometry(IGameObject gameObject)
     {
@@ -335,9 +375,9 @@ public class RipperGlbBuilder
     // ---- the walk ----
 
     private void AddGameObject(SceneBuilder sceneBuilder, NodeBuilder? parentNode, ITransform transform)
-        => AddGameObject(sceneBuilder, parentNode, transform, System.Numerics.Matrix4x4.Identity);
+        => AddGameObject(sceneBuilder, parentNode, transform, System.Numerics.Matrix4x4.Identity, false);
 
-    private void AddGameObject(SceneBuilder sceneBuilder, NodeBuilder? parentNode, ITransform transform, System.Numerics.Matrix4x4 pending)
+    private void AddGameObject(SceneBuilder sceneBuilder, NodeBuilder? parentNode, ITransform transform, System.Numerics.Matrix4x4 pending, bool hiddenState)
     {
         var gameObject = transform.GameObject_C4P;
         if (gameObject is null)
@@ -348,6 +388,7 @@ public class RipperGlbBuilder
         {
             return;
         }
+        hiddenState = hiddenState || hiddenStateRoots.Contains(gameObject.PathID);
 
         // combined local transform including any collapsed ancestors (glTF space)
         var combined = LocalMatrixGltf(transform) * pending;
@@ -356,7 +397,7 @@ public class RipperGlbBuilder
         {
             foreach (var childTransform in transform.Children_C4P.WhereNotNull())
             {
-                AddGameObject(sceneBuilder, parentNode, childTransform, combined);
+                AddGameObject(sceneBuilder, parentNode, childTransform, combined, hiddenState);
             }
             return;
         }
@@ -378,10 +419,11 @@ public class RipperGlbBuilder
         {
             node.Extras["unity_prefab_path"] = gameObject.Name.String;
         }
-        // hidden-in-game signals: inactive GameObject (the addon hides these on
-        // import). Roots are exempt: Rust stores prefab-scene roots deactivated
-        // and activates instances at spawn.
-        if (parentNode is not null && !gameObject.IsActive_Boolean && gameObject.IsActive_Byte == 0)
+        // hidden-in-game signals: inactive GameObject, or a non-default state
+        // variant subtree (unlocked/blocked keypads). Roots are exempt: Rust
+        // stores prefab-scene roots deactivated and activates at spawn.
+        if (parentNode is not null
+            && (hiddenState || (!gameObject.IsActive_Boolean && gameObject.IsActive_Byte == 0)))
         {
             node.Extras["unity_hidden"] = true;
         }
@@ -428,7 +470,7 @@ public class RipperGlbBuilder
 
         foreach (var childTransform in transform.Children_C4P.WhereNotNull())
         {
-            AddGameObject(sceneBuilder, node, childTransform);
+            AddGameObject(sceneBuilder, node, childTransform, System.Numerics.Matrix4x4.Identity, hiddenState);
         }
     }
 

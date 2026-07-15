@@ -698,6 +698,32 @@ internal sealed class Session
         }
         Directory.CreateDirectory(outDir);
         var outPath = System.IO.Path.GetFullPath(System.IO.Path.Combine(outDir, $"{resolved.Value.Name}.glb"));
+        // vehicle chassis: keep the module socket transforms (read from the
+        // serialized moduleSockets list) so modules can be placed exactly
+        var forceKeep = new HashSet<long>(options.ForceKeepPathIds);
+        foreach (var monoBehaviour in resolved.Value.Root.FetchHierarchy().OfType<IMonoBehaviour>())
+        {
+            if (monoBehaviour.LoadStructure() is not { } structure
+                || structure.TryGetField("moduleSockets") is not { } sockets)
+            {
+                continue;
+            }
+            foreach (var element in sockets.AsAssetArray)
+            {
+                if (element is AssetRipper.Import.Structure.Assembly.Serializable.SerializableStructure socket
+                    && socket.TryGetField("socketTransform") is { CValue: AssetRipper.Assets.Metadata.IPPtr pptr }
+                    && monoBehaviour.Collection.TryGetAsset(pptr.FileID, pptr.PathID) is AssetRipper.SourceGenerated.Classes.ClassID_4.ITransform socketTransform
+                    && socketTransform.GameObject_C4P is { } socketGo)
+                {
+                    forceKeep.Add(socketGo.PathID);
+                }
+            }
+        }
+        if (forceKeep.Count > 0)
+        {
+            options = options with { ForceKeepPathIds = forceKeep };
+        }
+
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var sceneBuilder = RipperGlbBuilder.Build(resolved.Value.Root, options, out var builder);
         bool ok;
