@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Rust Ripper",
     "author": "Rust Ripper",
-    "version": (0, 1, 2),
+    "version": (0, 1, 3),
     "blender": (4, 2, 0),
     "location": "3D Viewport > Sidebar > Rust",
     "description": "Import Rust Ripper GLB exports: correct visibility, paint controls, light tools, daemon search",
@@ -162,16 +162,112 @@ def _material_color_attributes(mat, objects):
     return names
 
 
-def _build_blend_layer_nodes(glb_path, materials, objects):
-    """Rust/Standard Blend Layer compositing, using the exact curve read from
-    the game's compiled fragment programs (docs/OUTPUT_CONTRACT.md):
+_BLEND_LAYER_GROUP = "Rust/Standard Blend Layer"
 
-        weight = vertexColour.a (or .r, per _DetailBlendMaskVertexSource)
-        blend  = min(1, (weight * mask.G * (_DetailBlendFactor + 1)) ** _DetailBlendFalloff)
-        base   = lerp(base, detailAlbedo * tint, blend)
 
-    Everything comes from shipped data: material extras + sidecar textures.
+def _blend_layer_group():
+    """One shared node group per shader family - the Blender equivalent of
+    the shader asset itself. Materials are instances: their own textures
+    outside, their own authored values on the group's sliders. The math
+    inside is the exact curve read from the game's compiled fragment
+    programs (docs/OUTPUT_CONTRACT.md):
+
+        blend = min(1, (weight * mask.G * (_DetailBlendFactor + 1)) ** _DetailBlendFalloff)
+        color = lerp(base, detailAlbedo * tint, blend)
     """
+    group = bpy.data.node_groups.get(_BLEND_LAYER_GROUP)
+    if group is not None:
+        return group
+    group = bpy.data.node_groups.new(_BLEND_LAYER_GROUP, "ShaderNodeTree")
+    group["rust_ripper_version"] = 1
+
+    def socket(name, in_out, socket_type, default=None):
+        item = group.interface.new_socket(name=name, in_out=in_out, socket_type=socket_type)
+        if default is not None:
+            item.default_value = default
+        return item
+
+    socket("Base Color", "INPUT", "NodeSocketColor", (0.8, 0.8, 0.8, 1.0))
+    socket("Detail Albedo", "INPUT", "NodeSocketColor", (1.0, 1.0, 1.0, 1.0))
+    socket("Tint", "INPUT", "NodeSocketColor", (1.0, 1.0, 1.0, 1.0))
+    socket("Mask", "INPUT", "NodeSocketColor", (1.0, 1.0, 1.0, 1.0))
+    socket("Vertex Weight", "INPUT", "NodeSocketFloat", 1.0)
+    # shader defaults; each material instance sets its authored values
+    socket("_DetailBlendFactor", "INPUT", "NodeSocketFloat", 8.0)
+    socket("_DetailBlendFalloff", "INPUT", "NodeSocketFloat", 1.0)
+    socket("_DetailBlendMaskMapInvert", "INPUT", "NodeSocketFloat", 0.0)
+    socket("Color", "OUTPUT", "NodeSocketColor")
+    socket("Blend Factor", "OUTPUT", "NodeSocketFloat")
+
+    nodes, links = group.nodes, group.links
+    group_in = nodes.new("NodeGroupInput")
+    group_out = nodes.new("NodeGroupOutput")
+
+    def math(op, label, first=None, second=None):
+        node = nodes.new("ShaderNodeMath")
+        node.operation = op
+        node.label = label
+        if first is not None:
+            node.inputs[0].default_value = first
+        if second is not None:
+            node.inputs[1].default_value = second
+        return node
+
+    sep = nodes.new("ShaderNodeSeparateColor")
+    sep.label = "mask green (shader reads .g)"
+    links.new(group_in.outputs["Mask"], sep.inputs["Color"])
+
+    inverted = math("SUBTRACT", "1 - mask", first=1.0)
+    links.new(sep.outputs["Green"], inverted.inputs[1])
+    pick = nodes.new("ShaderNodeMix")
+    pick.data_type = "FLOAT"
+    pick.label = "_DetailBlendMaskMapInvert switch"
+    links.new(group_in.outputs["_DetailBlendMaskMapInvert"], pick.inputs[0])
+    links.new(sep.outputs["Green"], pick.inputs[2])
+    links.new(inverted.outputs[0], pick.inputs[3])
+
+    weighted = math("MULTIPLY", "mask x vertex weight")
+    links.new(pick.outputs[0], weighted.inputs[0])
+    links.new(group_in.outputs["Vertex Weight"], weighted.inputs[1])
+
+    gain = math("ADD", "_DetailBlendFactor + 1", second=1.0)
+    links.new(group_in.outputs["_DetailBlendFactor"], gain.inputs[0])
+    gained = math("MULTIPLY", "x (_DetailBlendFactor + 1)")
+    links.new(weighted.outputs[0], gained.inputs[0])
+    links.new(gain.outputs[0], gained.inputs[1])
+
+    curved = math("POWER", "^ _DetailBlendFalloff")
+    links.new(gained.outputs[0], curved.inputs[0])
+    links.new(group_in.outputs["_DetailBlendFalloff"], curved.inputs[1])
+    clamped = math("MINIMUM", "min 1 (saturate)", second=1.0)
+    links.new(curved.outputs[0], clamped.inputs[0])
+
+    tinted = nodes.new("ShaderNodeMix")
+    tinted.data_type = "RGBA"
+    tinted.blend_type = "MULTIPLY"
+    tinted.inputs[0].default_value = 1.0
+    tinted.label = "detail layer (albedo x colour)"
+    links.new(group_in.outputs["Detail Albedo"], tinted.inputs[6])
+    links.new(group_in.outputs["Tint"], tinted.inputs[7])
+
+    blend = nodes.new("ShaderNodeMix")
+    blend.data_type = "RGBA"
+    blend.blend_type = "MIX"
+    blend.label = "blend by _DetailBlendMaskMap"
+    links.new(clamped.outputs[0], blend.inputs[0])
+    links.new(group_in.outputs["Base Color"], blend.inputs[6])
+    links.new(tinted.outputs[2], blend.inputs[7])
+
+    links.new(blend.outputs[2], group_out.inputs["Color"])
+    links.new(clamped.outputs[0], group_out.inputs["Blend Factor"])
+    _arrange_nodes(group)
+    return group
+
+
+def _build_blend_layer_nodes(glb_path, materials, objects):
+    """Materials with an active blend layer get a group instance wired to
+    their own textures and attributes - samplers cannot pass through group
+    sockets, so they live in the material and feed sampled colors in."""
     built = 0
     for mat in materials:
         if not mat or not mat.use_nodes:
@@ -201,55 +297,31 @@ def _build_blend_layer_nodes(glb_path, materials, objects):
             node.label = label
             return node
 
-        def math_node(op, label, second=None):
-            node = nodes.new("ShaderNodeMath")
-            node.operation = op
-            node.label = label
-            if second is not None:
-                node.inputs[1].default_value = second
-            return node
+        layer = nodes.new("ShaderNodeGroup")
+        layer.node_tree = _blend_layer_group()
+        layer.label = _BLEND_LAYER_GROUP
+        # authored values, straight from the material data
+        layer.inputs["_DetailBlendFactor"].default_value = floats.get("_DetailBlendFactor", 8.0)
+        layer.inputs["_DetailBlendFalloff"].default_value = floats.get("_DetailBlendFalloff", 1.0)
+        layer.inputs["_DetailBlendMaskMapInvert"].default_value = floats.get("_DetailBlendMaskMapInvert", 0.0)
 
         mask_node = image_node(mask_path, "_DetailBlendMaskMap", non_color=True)
         if floats.get("_DetailBlendMaskAddLowFreq", 0.0) != 0.0:
             mask_node.label += " (AddLowFreq second sample not built)"
+        links.new(mask_node.outputs["Color"], layer.inputs["Mask"])
 
-        sep = nodes.new("ShaderNodeSeparateColor")
-        sep.label = "mask green (shader reads .g)"
-        links.new(mask_node.outputs["Color"], sep.inputs["Color"])
-        weight_socket = sep.outputs["Green"]
-
-        if floats.get("_DetailBlendMaskMapInvert", 0.0) != 0.0:
-            invert = math_node("SUBTRACT", "_DetailBlendMaskMapInvert")
-            invert.inputs[0].default_value = 1.0
-            links.new(weight_socket, invert.inputs[1])
-            weight_socket = invert.outputs[0]
-
-        # meshes without a colour stream read (1,1,1,1) in Unity: skip the multiply
+        # meshes without a colour stream read (1,1,1,1) in Unity: leave weight at 1
         if "_RUST_COLOR" in attrs:
             vcol = nodes.new("ShaderNodeVertexColor")
             vcol.layer_name = "_RUST_COLOR"
             vcol.label = "vertex colour (blend weight)"
             if floats.get("_DetailBlendMaskVertexSource", 0.0) == 0.0:
-                weight_out = vcol.outputs["Alpha"]
+                links.new(vcol.outputs["Alpha"], layer.inputs["Vertex Weight"])
             else:
                 vsep = nodes.new("ShaderNodeSeparateColor")
                 vsep.label = "_DetailBlendMaskVertexSource=1 (red)"
                 links.new(vcol.outputs["Color"], vsep.inputs["Color"])
-                weight_out = vsep.outputs["Red"]
-            weighted = math_node("MULTIPLY", "mask x vertex weight")
-            links.new(weight_socket, weighted.inputs[0])
-            links.new(weight_out, weighted.inputs[1])
-            weight_socket = weighted.outputs[0]
-
-        # authored values live in the sockets; labels carry the game names
-        gained = math_node("MULTIPLY", "x (_DetailBlendFactor + 1)",
-                           floats.get("_DetailBlendFactor", 8.0) + 1.0)
-        links.new(weight_socket, gained.inputs[0])
-        curved = math_node("POWER", "^ _DetailBlendFalloff",
-                           floats.get("_DetailBlendFalloff", 1.0))
-        links.new(gained.outputs[0], curved.inputs[0])
-        clamped = math_node("MINIMUM", "min 1 (saturate)", 1.0)
-        links.new(curved.outputs[0], clamped.inputs[0])
+                links.new(vsep.outputs["Red"], layer.inputs["Vertex Weight"])
 
         detail_node = image_node(detail_path, "_DetailAlbedoMap", non_color=False)
         scale = list(detail_entry.get("scale", [1.0, 1.0]))
@@ -262,45 +334,29 @@ def _build_blend_layer_nodes(glb_path, materials, objects):
             uv = nodes.new("ShaderNodeUVMap")
             links.new(uv.outputs["UV"], mapping.inputs["Vector"])
             links.new(mapping.outputs["Vector"], detail_node.inputs["Vector"])
+        links.new(detail_node.outputs["Color"], layer.inputs["Detail Albedo"])
 
         if "_RUST_CUSTOMCOLOUR_01" in attrs:
             tint = nodes.new("ShaderNodeVertexColor")
             tint.layer_name = "_RUST_CUSTOMCOLOUR_01"
             tint.label = "customColour 01 (swap layer for other palette entries)"
-            tint_socket = tint.outputs["Color"]
+            links.new(tint.outputs["Color"], layer.inputs["Tint"])
         elif "_RUST_DETAILCOLOR" in attrs:
             tint = nodes.new("ShaderNodeVertexColor")
             tint.layer_name = "_RUST_DETAILCOLOR"
             tint.label = "_DetailColor (authored)"
-            tint_socket = tint.outputs["Color"]
+            links.new(tint.outputs["Color"], layer.inputs["Tint"])
         else:
-            tint = nodes.new("ShaderNodeRGB")
             colors = mat.get("unity_colors")
             authored = list(colors.get("_DetailColor", [1.0, 1.0, 1.0, 1.0])) if colors is not None else [1.0, 1.0, 1.0, 1.0]
-            tint.outputs[0].default_value = (*authored[:3], 1.0)
-            tint.label = "_DetailColor (as authored)"
-            tint_socket = tint.outputs[0]
+            layer.inputs["Tint"].default_value = (*authored[:3], 1.0)
 
-        tinted = nodes.new("ShaderNodeMix")
-        tinted.data_type = "RGBA"
-        tinted.blend_type = "MULTIPLY"
-        tinted.inputs[0].default_value = 1.0
-        tinted.label = "detail layer (albedo x colour)"
-        links.new(detail_node.outputs["Color"], tinted.inputs[6])
-        links.new(tint_socket, tinted.inputs[7])
-
-        blend = nodes.new("ShaderNodeMix")
-        blend.data_type = "RGBA"
-        blend.blend_type = "MIX"
-        blend.label = "blend by _DetailBlendMaskMap"
         base_input = bsdf.inputs["Base Color"]
         if base_input.is_linked:
-            links.new(base_input.links[0].from_socket, blend.inputs[6])
+            links.new(base_input.links[0].from_socket, layer.inputs["Base Color"])
         else:
-            blend.inputs[6].default_value = base_input.default_value
-        links.new(tinted.outputs[2], blend.inputs[7])
-        links.new(clamped.outputs[0], blend.inputs[0])
-        links.new(blend.outputs[2], base_input)
+            layer.inputs["Base Color"].default_value = base_input.default_value
+        links.new(layer.outputs["Color"], base_input)
         built += 1
     return built
 
@@ -310,7 +366,8 @@ def _build_blend_layer_nodes(glb_path, materials, objects):
 _NODE_HEIGHT = {
     "TEX_IMAGE": 290, "BSDF_PRINCIPLED": 640, "MIX": 190, "MATH": 160,
     "VALUE": 90, "RGB": 200, "SEPARATE_COLOR": 130, "NORMAL_MAP": 170,
-    "MAPPING": 330, "UVMAP": 100, "VERTEX_COLOR": 120, "GROUP": 240,
+    "MAPPING": 330, "UVMAP": 100, "VERTEX_COLOR": 120, "GROUP": 300,
+    "GROUP_INPUT": 300, "GROUP_OUTPUT": 120,
     "OUTPUT_MATERIAL": 110,
 }
 
