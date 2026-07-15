@@ -908,6 +908,8 @@ internal sealed class Session
                 {
                     null => "?missing",
                     IMonoBehaviour monoBehaviour => $"MB:{monoBehaviour.ScriptP?.ClassName_R.String ?? "?"}",
+                    AssetRipper.SourceGenerated.Classes.ClassID_205.ILODGroup lodGroup =>
+                        $"LODGroup(lods={lodGroup.LODs.Count}, renderers=[{string.Join("/", lodGroup.LODs.Select(l => $"{l.Renderers.Count(rp => rp.Renderer.TryGetAsset(lodGroup.Collection, out AssetRipper.SourceGenerated.Classes.ClassID_25.IRenderer? _))}r"))}])",
                     _ => component.ClassName,
                 };
                 if (label != "Transform")
