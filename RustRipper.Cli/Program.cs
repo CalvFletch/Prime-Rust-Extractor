@@ -368,6 +368,10 @@ internal static class Cli
                     case "/coverage":
                         WriteJson(context, 200, new { report = session.Coverage() });
                         break;
+                    case "/fields":
+                        var fieldsReport = session.FieldsReport(q, request.QueryString["cls"]);
+                        WriteJson(context, fieldsReport != null ? 200 : 404, new { report = fieldsReport });
+                        break;
                     case "/hier":
                         var hierReport = session.HierarchyReport(q);
                         WriteJson(context, hierReport != null ? 200 : 404, new { report = hierReport });
@@ -931,6 +935,104 @@ internal sealed class Session
         }
         Walk(resolved.Value.Root.GetTransform(), 0);
         return sb.ToString();
+    }
+
+    private Dictionary<string, string>? guidToPath;
+
+    /// <summary>
+    /// Serialized field dump for every MonoBehaviour in a prefab (optionally
+    /// one class). GameObjectRef guids resolve through the GameManifest
+    /// catalog to prefab paths - the key for cross-prefab composition
+    /// (ConditionalModel.prefab, wearables, module items).
+    /// </summary>
+    public string? FieldsReport(string query, string? classFilter)
+    {
+        var resolved = ResolveExportSet(query);
+        if (resolved == null)
+        {
+            return null;
+        }
+        guidToPath ??= Catalog.Entries
+            .Where(e => e.PrefabGuid.Length > 0 && e.PrefabPath.Length > 0)
+            .GroupBy(e => e.PrefabGuid)
+            .ToDictionary(g => g.Key, g => g.First().PrefabPath);
+
+        var sb = new StringBuilder();
+        sb.AppendLine($"=== fields for {resolved.Value.Name}{(classFilter != null ? $" (class {classFilter})" : "")} ===");
+        foreach (var monoBehaviour in resolved.Value.Root.FetchHierarchy().OfType<IMonoBehaviour>())
+        {
+            var className = monoBehaviour.ScriptP?.ClassName_R.String ?? "?";
+            if (classFilter != null && !className.Equals(classFilter, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+            sb.AppendLine($"--- {className}  (PathID {monoBehaviour.PathID})");
+            if (monoBehaviour.LoadStructure() is { } structure)
+            {
+                DumpStructure(sb, structure, monoBehaviour.Collection, 1);
+            }
+        }
+        return sb.ToString();
+    }
+
+    private void DumpStructure(StringBuilder sb, SerializableStructure structure, AssetRipper.Assets.Collections.AssetCollection collection, int depth)
+    {
+        if (depth > 4)
+        {
+            return;
+        }
+        for (var i = 0; i < structure.Type.Fields.Count && i < structure.Fields.Length; i++)
+        {
+            DumpValue(sb, structure.Type.Fields[i].Name, structure.Fields[i], collection, depth);
+        }
+    }
+
+    private void DumpValue(StringBuilder sb, string name, SerializableValue value, AssetRipper.Assets.Collections.AssetCollection collection, int depth)
+    {
+        var pad = new string(' ', depth * 2);
+        switch (value.CValue)
+        {
+            case null:
+                sb.AppendLine($"{pad}{name} = {value.PValue}");
+                break;
+            case AssetRipper.Primitives.Utf8String u:
+                var text = u.String;
+                sb.AppendLine($"{pad}{name} = \"{text}\"{GuidHint(name, text)}");
+                break;
+            case string s:
+                sb.AppendLine($"{pad}{name} = \"{s}\"{GuidHint(name, s)}");
+                break;
+            case AssetRipper.Assets.Metadata.IPPtr pptr:
+                var target = collection.TryGetAsset(pptr.FileID, pptr.PathID);
+                sb.AppendLine($"{pad}{name} = PPtr -> {(target is null ? $"unresolved({pptr.FileID}/{pptr.PathID})" : $"{target.ClassName} \"{(target as AssetRipper.Assets.IUnityObjectBase)?.GetBestName()}\"")}");
+                break;
+            case SerializableStructure sub:
+                sb.AppendLine($"{pad}{name}:");
+                DumpStructure(sb, sub, collection, depth + 1);
+                break;
+            case IUnityAssetBase[] array:
+                sb.AppendLine($"{pad}{name}[{array.Length}]:");
+                foreach (var element in array.Take(8))
+                {
+                    if (element is SerializableStructure elementStructure)
+                    {
+                        DumpStructure(sb, elementStructure, collection, depth + 1);
+                    }
+                }
+                break;
+            default:
+                sb.AppendLine($"{pad}{name} = ({value.CValue.GetType().Name})");
+                break;
+        }
+    }
+
+    private string GuidHint(string fieldName, string text)
+    {
+        if (text.Length == 32 && guidToPath is not null && guidToPath.TryGetValue(text, out var path))
+        {
+            return $"   -> {path}";
+        }
+        return "";
     }
 
     /// <summary>

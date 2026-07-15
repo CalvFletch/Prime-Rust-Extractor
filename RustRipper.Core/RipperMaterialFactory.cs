@@ -78,7 +78,12 @@ public class RipperMaterialFactory
         {
             if (texEnv.Texture.TryGetAsset(material.Collection) is ITexture2D slotTexture)
             {
-                texturesJson[slot.String] = slotTexture.Name.String;
+                texturesJson[slot.String] = new System.Text.Json.Nodes.JsonObject
+                {
+                    ["name"] = slotTexture.Name.String,
+                    ["scale"] = new System.Text.Json.Nodes.JsonArray(texEnv.Scale.X, texEnv.Scale.Y),
+                    ["offset"] = new System.Text.Json.Nodes.JsonArray(texEnv.Offset.X, texEnv.Offset.Y),
+                };
             }
         }
         builder.Extras = new System.Text.Json.Nodes.JsonObject
