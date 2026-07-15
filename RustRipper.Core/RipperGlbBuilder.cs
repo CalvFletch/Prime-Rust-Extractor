@@ -74,8 +74,6 @@ public record RipperGlbOptions
 /// </summary>
 public class RipperGlbBuilder
 {
-    private static readonly string[] FacepunchLodClasses = ["RendererLOD", "MeshLOD", "SkinnedMeshLOD"];
-
     private readonly RipperGlbOptions options;
     private readonly RipperMaterialFactory materials;
     private readonly Dictionary<IMesh, MeshData> meshCache = new();
@@ -102,6 +100,7 @@ public class RipperGlbBuilder
         builder.BuildLodMembership(root);
         builder.BuildNameConventionLodMembership(root);
         builder.BuildHiddenStateVariants(root);
+        builder.BuildSocketForceKeep(root);
         builder.BuildKeepSet(root);
         var sceneBuilder = new SceneBuilder();
         builder.AddGameObject(sceneBuilder, null, root.GetTransform());
@@ -203,10 +202,10 @@ public class RipperGlbBuilder
                     break;
                 }
                 case IMonoBehaviour monoBehaviour when
-                    FacepunchLodClasses.Contains(monoBehaviour.ScriptP?.ClassName_R.String):
+                    ComponentSemantics.LodStates.FirstOrDefault(s => s.ClassName == monoBehaviour.ScriptP?.ClassName_R.String) is { } schema:
                 {
                     if (monoBehaviour.LoadStructure() is not { } structure
-                        || structure.TryGetField("States") is not { } states)
+                        || structure.TryGetField(schema.StatesField) is not { } states)
                     {
                         break;
                     }
@@ -217,10 +216,10 @@ public class RipperGlbBuilder
                         {
                             continue;
                         }
-                        var distance = state.TryGetField("distance")?.AsSingle ?? 0f;
-                        var shadowOnly = state.TryGetField("shadowMode") is { } sm
+                        var distance = state.TryGetField(schema.DistanceField)?.AsSingle ?? 0f;
+                        var shadowOnly = state.TryGetField(schema.ShadowModeField) is { } sm
                             && (ShadowCastingMode)sm.AsInt32 == ShadowCastingMode.ShadowsOnly;
-                        if (state.TryGetField("renderer") is { CValue: AssetRipper.Assets.Metadata.IPPtr pptr }
+                        if (state.TryGetField(schema.RendererField) is { CValue: AssetRipper.Assets.Metadata.IPPtr pptr }
                             && monoBehaviour.Collection.TryGetAsset(pptr.FileID, pptr.PathID) is IRenderer stateRenderer)
                         {
                             parsed.Add((distance, stateRenderer, shadowOnly));
@@ -316,22 +315,51 @@ public class RipperGlbBuilder
         }
     }
 
+    private readonly HashSet<long> socketKeep = new();
+
     private bool Contributes(IGameObject gameObject)
         => EmitsGeometry(gameObject)
         || (options.IncludeLights && gameObject.TryGetComponent(out ILight? _))
-        || options.ForceKeepPathIds.Contains(gameObject.PathID);
+        || options.ForceKeepPathIds.Contains(gameObject.PathID)
+        || socketKeep.Contains(gameObject.PathID);
+
+    /// <summary>Force-keep attachment transforms declared by serialized socket
+    /// lists (ComponentSemantics.SocketLists) as named empties.</summary>
+    private void BuildSocketForceKeep(IGameObject root)
+    {
+        foreach (var monoBehaviour in root.FetchHierarchy().OfType<IMonoBehaviour>())
+        {
+            if (monoBehaviour.LoadStructure() is not { } structure)
+            {
+                continue;
+            }
+            foreach (var schema in ComponentSemantics.SocketLists)
+            {
+                if (structure.TryGetField(schema.ListField) is not { } list)
+                {
+                    continue;
+                }
+                foreach (var element in list.AsAssetArray)
+                {
+                    if (element is SerializableStructure socket
+                        && socket.TryGetField(schema.TransformField) is { CValue: AssetRipper.Assets.Metadata.IPPtr pptr }
+                        && monoBehaviour.Collection.TryGetAsset(pptr.FileID, pptr.PathID) is ITransform socketTransform
+                        && socketTransform.GameObject_C4P is { } socketGo)
+                    {
+                        socketKeep.Add(socketGo.PathID);
+                    }
+                }
+            }
+        }
+    }
 
     /// <summary>
     /// State-variant components declare which child subtrees are alternate
     /// runtime states (locked/unlocked/blocked keypads...). The non-default
     /// states export hidden - present, togglable, not cluttering the view.
-    /// Read from the components' own serialized fields, per class.
+    /// Read from the components' own serialized fields, per class
+    /// (ComponentSemantics.HiddenStateVariants).
     /// </summary>
-    private static readonly Dictionary<string, string[]> HiddenStateFields = new()
-    {
-        ["ModularCarCodeLockVisuals"] = ["unlockedVisuals", "blockedVisuals"],
-    };
-
     private readonly HashSet<long> hiddenStateRoots = new();
 
     private void BuildHiddenStateVariants(IGameObject root)
@@ -339,7 +367,7 @@ public class RipperGlbBuilder
         foreach (var monoBehaviour in root.FetchHierarchy().OfType<IMonoBehaviour>())
         {
             if (monoBehaviour.ScriptP?.ClassName_R.String is not { } className
-                || !HiddenStateFields.TryGetValue(className, out var fields)
+                || !ComponentSemantics.HiddenStateVariants.TryGetValue(className, out var fields)
                 || monoBehaviour.LoadStructure() is not { } structure)
             {
                 continue;

@@ -365,6 +365,9 @@ internal static class Cli
                     case "/matscan":
                         WriteJson(context, 200, new { report = session.MatScan() });
                         break;
+                    case "/coverage":
+                        WriteJson(context, 200, new { report = session.Coverage() });
+                        break;
                     case "/hier":
                         var hierReport = session.HierarchyReport(q);
                         WriteJson(context, hierReport != null ? 200 : 404, new { report = hierReport });
@@ -698,32 +701,6 @@ internal sealed class Session
         }
         Directory.CreateDirectory(outDir);
         var outPath = System.IO.Path.GetFullPath(System.IO.Path.Combine(outDir, $"{resolved.Value.Name}.glb"));
-        // vehicle chassis: keep the module socket transforms (read from the
-        // serialized moduleSockets list) so modules can be placed exactly
-        var forceKeep = new HashSet<long>(options.ForceKeepPathIds);
-        foreach (var monoBehaviour in resolved.Value.Root.FetchHierarchy().OfType<IMonoBehaviour>())
-        {
-            if (monoBehaviour.LoadStructure() is not { } structure
-                || structure.TryGetField("moduleSockets") is not { } sockets)
-            {
-                continue;
-            }
-            foreach (var element in sockets.AsAssetArray)
-            {
-                if (element is AssetRipper.Import.Structure.Assembly.Serializable.SerializableStructure socket
-                    && socket.TryGetField("socketTransform") is { CValue: AssetRipper.Assets.Metadata.IPPtr pptr }
-                    && monoBehaviour.Collection.TryGetAsset(pptr.FileID, pptr.PathID) is AssetRipper.SourceGenerated.Classes.ClassID_4.ITransform socketTransform
-                    && socketTransform.GameObject_C4P is { } socketGo)
-                {
-                    forceKeep.Add(socketGo.PathID);
-                }
-            }
-        }
-        if (forceKeep.Count > 0)
-        {
-            options = options with { ForceKeepPathIds = forceKeep };
-        }
-
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var sceneBuilder = RipperGlbBuilder.Build(resolved.Value.Root, options, out var builder);
         bool ok;
@@ -953,6 +930,56 @@ internal sealed class Session
             }
         }
         Walk(resolved.Value.Root.GetTransform(), 0);
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Coverage report: of everything in the loaded bundles, how much do our
+    /// interpretation tables actually cover? Materials grouped by shader
+    /// (mapped = an explicit ShaderProfiles row), MonoBehaviours grouped by
+    /// class (handled = a ComponentSemantics row or core reader). Priorities
+    /// come from these numbers, not from individual assets.
+    /// </summary>
+    public string Coverage()
+    {
+        var sb = new StringBuilder();
+
+        var shaderCounts = new Dictionary<string, int>();
+        long totalMaterials = 0, mappedMaterials = 0;
+        foreach (var material in GameData.GameBundle.FetchAssets().OfType<IMaterial>())
+        {
+            var shader = material.Shader_C21P?.Name.String ?? "(no shader)";
+            shaderCounts[shader] = shaderCounts.GetValueOrDefault(shader) + 1;
+            totalMaterials++;
+            if (RustRipper.Core.ShaderProfiles.IsMapped(shader))
+            {
+                mappedMaterials++;
+            }
+        }
+        sb.AppendLine($"=== material coverage: {mappedMaterials}/{totalMaterials} instances ({(totalMaterials > 0 ? 100.0 * mappedMaterials / totalMaterials : 0):F1}%) on mapped shaders ===");
+        foreach (var (shader, count) in shaderCounts.OrderByDescending(e => e.Value).Take(40))
+        {
+            var status = RustRipper.Core.ShaderProfiles.IsMapped(shader)
+                ? RustRipper.Core.ShaderProfiles.Resolve(shader).Id
+                : "UNMAPPED (fallback: standard)";
+            sb.AppendLine($"  {count,6}  {shader,-52} {status}");
+        }
+
+        var classCounts = new Dictionary<string, int>();
+        foreach (var monoBehaviour in GameData.GameBundle.FetchAssets().OfType<IMonoBehaviour>())
+        {
+            var className = monoBehaviour.ScriptP?.ClassName_R.String ?? "(unresolved script)";
+            classCounts[className] = classCounts.GetValueOrDefault(className) + 1;
+        }
+        var handled = new HashSet<string>(RustRipper.Core.ComponentSemantics.LodStates.Select(s => s.ClassName));
+        handled.UnionWith(RustRipper.Core.ComponentSemantics.HiddenStateVariants.Keys);
+        sb.AppendLine();
+        sb.AppendLine($"=== component classes (top 40 of {classCounts.Count}; semantics rows are read, rest passthrough-to-extras) ===");
+        foreach (var (className, count) in classCounts.OrderByDescending(e => e.Value).Take(40))
+        {
+            var status = handled.Contains(className) ? "semantics" : "passthrough";
+            sb.AppendLine($"  {count,6}  {className,-52} {status}");
+        }
         return sb.ToString();
     }
 

@@ -54,6 +54,9 @@ public class RipperMaterialFactory
     {
         var builder = new MaterialBuilder(material.Name).WithMetallicRoughnessShader();
         var shaderName = material.Shader_C21P?.Name.String ?? "";
+        var profile = ShaderProfiles.Resolve(shaderName);
+        // "(Specular setup)" is part of the shader's type identity string —
+        // Unity's own family marker for the specular workflow variant
         var isSpecularWorkflow = shaderName.Contains("Specular", StringComparison.OrdinalIgnoreCase);
         var floats = GetFloats(material);
         var colors = GetColors(material);
@@ -84,6 +87,7 @@ public class RipperMaterialFactory
             ["unity_path_id"] = material.PathID,
             ["unity_collection"] = material.Collection.Name,
             ["unity_shader"] = shaderName,
+            ["rust_profile"] = profile.Id,
             ["unity_floats"] = floatsJson,
             ["unity_colors"] = colorsJson,
             ["unity_textures"] = texturesJson,
@@ -130,10 +134,11 @@ public class RipperMaterialFactory
         // The detail layer is Rust's paint system (barrels: _DetailMask marks
         // the painted band, _DetailColor is the paint) - baked into the albedo.
         var baseColor = SrgbToLinearFactor(colors.TryGetValue("_Color", out var c) ? c : new System.Numerics.Vector4(1, 1, 1, 1));
-        var fuzzTexture = GetTexture(material, "_FuzzMask");
-        var diffuseTexture = GetTexture(material, "_MainTex", "_BaseColorMap", "_AlbedoMap", "_Diffuse");
-        var detailMask = GetTexture(material, "_DetailMask");
-        var detailTintActive = floats.TryGetValue("_DetailLayer", out var detailLayer) && detailLayer != 0f
+        var fuzzTexture = profile.FuzzMaskSlot is { } fuzzSlot ? GetTexture(material, fuzzSlot) : null;
+        var diffuseTexture = GetTexture(material, profile.BaseColorSlots);
+        var detailMask = profile.SupportsDetailPaint ? GetTexture(material, "_DetailMask") : null;
+        var detailTintActive = profile.SupportsDetailPaint
+            && floats.TryGetValue("_DetailLayer", out var detailLayer) && detailLayer != 0f
             && detailMask is not null
             && GetTexture(material, "_DetailAlbedoMap") is null
             && colors.TryGetValue("_DetailColor", out var detailColor);
@@ -182,7 +187,7 @@ public class RipperMaterialFactory
                 }
             }
         }
-        if (!baseColorSet && diffuseTexture is not null && ColorizeEnabled(floats)
+        if (!baseColorSet && diffuseTexture is not null && profile.SupportsColorize && ColorizeEnabled(floats)
             && GetTexture(material, "_ColorizeMask") is { } colorizeMask)
         {
             var cR = colors.TryGetValue("_ColorizeColorR", out var vr) ? vr : new System.Numerics.Vector4(1, 1, 1, 0);
@@ -202,7 +207,7 @@ public class RipperMaterialFactory
                 baseColorSet = true;
             }
         }
-        if (!baseColorSet && TryGetImage(material, "raw", out var mainImage, out var mainName, "_MainTex", "_BaseColorMap", "_AlbedoMap", "_Diffuse"))
+        if (!baseColorSet && TryGetImage(material, "raw", out var mainImage, out var mainName, profile.BaseColorSlots))
         {
             builder.WithBaseColor(mainImage.Value, baseColor);
             NameChannelImage(builder, KnownChannel.BaseColor, mainName);
@@ -214,7 +219,7 @@ public class RipperMaterialFactory
         }
 
         // --- normal map (reconstructed from Unity's swizzled storage) ---
-        if (TryGetImage(material, "normal", out var normalImage, out var normalName, "_BumpMap", "_NormalMap", "_Normal"))
+        if (TryGetImage(material, "normal", out var normalImage, out var normalName, profile.NormalSlots))
         {
             var scale = floats.TryGetValue("_BumpScale", out var bs) ? bs : 1f;
             builder.WithNormal(normalImage.Value, scale);
@@ -231,7 +236,7 @@ public class RipperMaterialFactory
         var glossMapScale = floats.TryGetValue("_GlossMapScale", out var gms) ? gms : 1f;
         var metallic = isSpecularWorkflow ? 0f : (floats.TryGetValue("_Metallic", out var met) ? met : 0f);
         var smoothnessFromAlbedo = floats.TryGetValue("_SmoothnessTextureChannel", out var stc) && (int)stc == 1;
-        if (TryGetImage(material, $"packedmap:{glossMapScale:F3}", out var pmImage, out var pmName, "_PackedMap"))
+        if (TryGetImage(material, $"packedmap:{glossMapScale:F3}", out var pmImage, out var pmName, profile.PackedOrmSlots))
         {
             // Rust _PackedMap: G=glossiness, B=metallic, A=AO -> glTF ORM in one image
             builder.WithMetallicRoughness(pmImage.Value, 1f, 1f);
@@ -239,25 +244,25 @@ public class RipperMaterialFactory
             builder.WithOcclusion(pmImage.Value, floats.TryGetValue("_OcclusionStrength", out var pmOcc) ? pmOcc : 1f);
             NameChannelImage(builder, KnownChannel.Occlusion, pmName);
         }
-        else if (!isSpecularWorkflow && TryGetImage(material, $"metalgloss:{glossMapScale:F3}", out var mrImage, out var mrName, "_MetallicGlossMap"))
+        else if (!isSpecularWorkflow && TryGetImage(material, $"metalgloss:{glossMapScale:F3}", out var mrImage, out var mrName, profile.MetalGlossSlots))
         {
             builder.WithMetallicRoughness(mrImage.Value, 1f, 1f);
             NameChannelImage(builder, KnownChannel.MetallicRoughness, mrName);
         }
-        else if (TryGetImage(material, $"specgloss:{glossMapScale:F3}", out var sgImage, out var sgName, "_SpecGlossMap", "_SpecularMap", "_Specular"))
+        else if (TryGetImage(material, $"specgloss:{glossMapScale:F3}", out var sgImage, out var sgName, profile.SpecGlossSlots))
         {
             // gloss alpha becomes roughness (non-metal), and the spec map's RGB
             // is the dielectric F0 exactly - KHR_materials_specular carries it
             // (Blender wires specularColorTexture into Specular Tint)
             builder.WithMetallicRoughness(sgImage.Value, 0f, 1f);
             NameChannelImage(builder, KnownChannel.MetallicRoughness, sgName);
-            if (TryGetImage(material, "raw", out var sgRaw, out var sgRawName, "_SpecGlossMap", "_SpecularMap", "_Specular"))
+            if (TryGetImage(material, "raw", out var sgRaw, out var sgRawName, profile.SpecGlossSlots))
             {
                 builder.WithSpecularColor(ImageBuilder.From(sgRaw.Value, sgRawName ?? "specular"), null);
             }
         }
-        else if (smoothnessFromAlbedo && diffuseTexture is not null
-            && TryGetImage(material, $"albedogloss:{glossMapScale:F3}", out var agImage, out var agName, "_MainTex", "_BaseColorMap", "_AlbedoMap", "_Diffuse"))
+        else if (profile.SupportsAlbedoAlphaSmoothness && smoothnessFromAlbedo && diffuseTexture is not null
+            && TryGetImage(material, $"albedogloss:{glossMapScale:F3}", out var agImage, out var agName, profile.BaseColorSlots))
         {
             builder.WithMetallicRoughness(agImage.Value, metallic, 1f);
             NameChannelImage(builder, KnownChannel.MetallicRoughness, agName);
@@ -281,7 +286,7 @@ public class RipperMaterialFactory
         }
 
         // --- occlusion ---
-        if (TryGetImage(material, "raw", out var occlusionImage, out var occlusionName, "_OcclusionMap", "_AO"))
+        if (TryGetImage(material, "raw", out var occlusionImage, out var occlusionName, profile.OcclusionSlots))
         {
             var strength = floats.TryGetValue("_OcclusionStrength", out var os) ? os : 1f;
             builder.WithOcclusion(occlusionImage.Value, strength);
@@ -293,7 +298,7 @@ public class RipperMaterialFactory
         {
             var strength = MathF.Max(1f, MathF.Max(emission.X, MathF.Max(emission.Y, emission.Z)));
             var emissiveRgb = new System.Numerics.Vector3(emission.X, emission.Y, emission.Z) / strength;
-            if (TryGetImage(material, "raw", out var emissionImage, out var emissionName, "_EmissionMap"))
+            if (TryGetImage(material, "raw", out var emissionImage, out var emissionName, profile.EmissiveSlots))
             {
                 builder.WithEmissive(emissionImage.Value, emissiveRgb);
                 NameChannelImage(builder, KnownChannel.Emissive, emissionName);
