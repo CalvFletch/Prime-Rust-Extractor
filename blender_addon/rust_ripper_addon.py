@@ -209,12 +209,6 @@ def _build_blend_layer_nodes(glb_path, materials, objects):
                 node.inputs[1].default_value = second
             return node
 
-        def value_node(name):
-            node = nodes.new("ShaderNodeValue")
-            node.outputs[0].default_value = floats.get(name, 0.0)
-            node.label = f"{name} (data)"
-            return node
-
         mask_node = image_node(mask_path, "_DetailBlendMaskMap", non_color=True)
         if floats.get("_DetailBlendMaskAddLowFreq", 0.0) != 0.0:
             mask_node.label += " (AddLowFreq second sample not built)"
@@ -247,16 +241,13 @@ def _build_blend_layer_nodes(glb_path, materials, objects):
             links.new(weight_out, weighted.inputs[1])
             weight_socket = weighted.outputs[0]
 
-        factor = value_node("_DetailBlendFactor")
-        falloff = value_node("_DetailBlendFalloff")
-        gain = math_node("ADD", "_DetailBlendFactor + 1", 1.0)
-        links.new(factor.outputs[0], gain.inputs[0])
-        gained = math_node("MULTIPLY", "x (_DetailBlendFactor + 1)")
+        # authored values live in the sockets; labels carry the game names
+        gained = math_node("MULTIPLY", "x (_DetailBlendFactor + 1)",
+                           floats.get("_DetailBlendFactor", 8.0) + 1.0)
         links.new(weight_socket, gained.inputs[0])
-        links.new(gain.outputs[0], gained.inputs[1])
-        curved = math_node("POWER", "^ _DetailBlendFalloff")
+        curved = math_node("POWER", "^ _DetailBlendFalloff",
+                           floats.get("_DetailBlendFalloff", 1.0))
         links.new(gained.outputs[0], curved.inputs[0])
-        links.new(falloff.outputs[0], curved.inputs[1])
         clamped = math_node("MINIMUM", "min 1 (saturate)", 1.0)
         links.new(curved.outputs[0], clamped.inputs[0])
 
@@ -325,8 +316,11 @@ _NODE_HEIGHT = {
 
 
 def _arrange_nodes(tree):
-    """Deterministic left-to-right layout: column = distance to the output
-    side, rows barycenter-sorted so links stay short. No overlaps, ever."""
+    """Neat left-to-right layout. Columns = longest link distance to the
+    output. Rows follow the consumers' input-socket order (base colour
+    chain is the top band, roughness below, normal below that - the BSDF's
+    own order), and every node is pulled level with the socket it feeds,
+    pushed down only when it would overlap its column neighbour."""
     nodes = [n for n in tree.nodes if n.type != "FRAME"]
     depth = {n: 0 for n in nodes}
     for _ in range(len(nodes)):
@@ -338,18 +332,46 @@ def _arrange_nodes(tree):
                 changed = True
         if not changed:
             break
+
+    # semantic order: depth-first from the output side, inputs top-to-bottom,
+    # so each column stacks in the order its chains hang off the BSDF
+    order = {}
+
+    def visit(node):
+        if node in order:
+            return
+        order[node] = len(order)
+        for socket in node.inputs:
+            for link in socket.links:
+                visit(link.from_node)
+
+    for node in nodes:
+        if not any(s.links for s in node.outputs):
+            visit(node)
+    for node in nodes:
+        visit(node)
+
     columns = {}
     for node in nodes:
         columns.setdefault(depth[node], []).append(node)
     for d in sorted(columns):
-        def barycenter(node):
-            ys = [l.to_node.location.y for s in node.outputs for l in s.links]
-            return -sum(ys) / len(ys) if ys else 0.0
-        column = sorted(columns[d], key=barycenter)
-        y = 0.0
-        for node in column:
+        cursor = None
+        for node in sorted(columns[d], key=lambda n: order[n]):
+            # level with the topmost socket this node feeds
+            desired = []
+            for socket in node.outputs:
+                for link in socket.links:
+                    consumer = link.to_node
+                    try:
+                        slot = list(consumer.inputs).index(link.to_socket)
+                    except ValueError:
+                        slot = 0
+                    desired.append(consumer.location.y - 40.0 - slot * 22.0)
+            y = max(desired) if desired else 0.0
+            if cursor is not None:
+                y = min(y, cursor)
             node.location = (-d * 340.0, y)
-            y -= _NODE_HEIGHT.get(node.type, 160) + 40.0
+            cursor = y - _NODE_HEIGHT.get(node.type, 160) - 40.0
 
 
 def _import_glb(context, filepath):
