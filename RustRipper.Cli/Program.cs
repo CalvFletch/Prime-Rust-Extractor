@@ -341,6 +341,8 @@ internal static class Cli
                             PruneEmpties = request.QueryString["no-prune"] == null,
                             IncludeVertexColors = request.QueryString["vertex-colors"] != null,
                             PaintNodes = request.QueryString["paint-nodes"] != null,
+                            IncludeLights = request.QueryString["no-lights"] == null,
+                            CollapseEmptyChains = request.QueryString["keep-chains"] == null,
                         };
                         var result = session.ExportGlb(q, outDir, options);
                         WriteJson(context, result.Success ? 200 : 404, new { success = result.Success, message = result.Message, path = result.Path, seconds = result.Seconds });

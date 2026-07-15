@@ -49,9 +49,10 @@ public record RipperGlbOptions
     /// (KHR_lights_punctual) — Blender imports them as lamps.</summary>
     public bool IncludeLights { get; init; } = true;
 
-    /// <summary>Collapse pass-through empties: a node with no mesh/light and
-    /// exactly one kept child contributes nothing but a transform, which gets
-    /// folded into that child. Branching nodes and the root survive.</summary>
+    /// <summary>Dissolve every empty except the root: a node with no mesh and
+    /// no light contributes nothing but a transform, which is folded into its
+    /// children — they re-parent to the nearest content node (mesh) or the
+    /// root, matching how an artist would clean the hierarchy.</summary>
     public bool CollapseEmptyChains { get; init; } = true;
 }
 
@@ -307,14 +308,11 @@ public class RipperGlbBuilder
 
         if (options.CollapseEmptyChains && parentNode is not null && !Contributes(gameObject))
         {
-            var keptChildren = transform.Children_C4P.WhereNotNull()
-                .Where(ct => ct.GameObject_C4P is { } childGo && (!options.PruneEmpties || keep.Contains(childGo)))
-                .ToList();
-            if (keptChildren.Count == 1)
+            foreach (var childTransform in transform.Children_C4P.WhereNotNull())
             {
-                AddGameObject(sceneBuilder, parentNode, keptChildren[0], combined);
-                return;
+                AddGameObject(sceneBuilder, parentNode, childTransform, combined);
             }
+            return;
         }
 
         var node = parentNode is null ? new NodeBuilder(gameObject.Name) : parentNode.CreateNode(gameObject.Name);
@@ -324,6 +322,13 @@ public class RipperGlbBuilder
             ["unity_path_id"] = gameObject.PathID,
             ["unity_collection"] = gameObject.Collection.Name,
         };
+        // hidden-in-game signals: inactive GameObject (the addon hides these on
+        // import). Roots are exempt: Rust stores prefab-scene roots deactivated
+        // and activates instances at spawn.
+        if (parentNode is not null && !gameObject.IsActive_Boolean && gameObject.IsActive_Byte == 0)
+        {
+            node.Extras["unity_hidden"] = true;
+        }
         if (parentNode is not null)
         {
             node.LocalMatrix = combined;
@@ -455,11 +460,16 @@ public class RipperGlbBuilder
         }
 
         var pairs = new (ISubMesh, MaterialBuilder)[subsetIndices.Length];
+        var hasRealMaterial = false;
         for (var i = 0; i < subsetIndices.Length; i++)
         {
             var material = i < renderer.Materials_C25.Count
                 && renderer.Materials_C25[i].TryGetAsset(renderer.Collection, out AssetRipper.SourceGenerated.Classes.ClassID_21.IMaterial? m)
                 ? m : null;
+            if (material is not null && material.Name.String != "Default-Material")
+            {
+                hasRealMaterial = true;
+            }
             if (material is not null
                 && ((RipperMaterialFactory.TryGetFloat(material, "_ApplyVertexColor", out var avc) && avc != 0f)
                     || (RipperMaterialFactory.TryGetFloat(material, "_ApplyVertexAlpha", out var ava) && ava != 0f)))
@@ -467,6 +477,12 @@ public class RipperGlbBuilder
                 vertexColorTintMaterials.Add(material.PathID);
             }
             pairs[i] = (subMeshes[subsetIndices[i]], materials.GetOrMake(material));
+        }
+        // hidden-in-game signals: disabled renderer, or nothing but Unity's
+        // placeholder material (utility geometry like IO wiring origins)
+        if ((!renderer.Enabled_C25 || !hasRealMaterial) && node.Extras is JsonObject nodeExtras)
+        {
+            nodeExtras["unity_hidden"] = true;
         }
         IMeshBuilder<MaterialBuilder> meshBuilder = GlbSubMeshBuilder.BuildSubMeshes(
             new ArraySegment<(ISubMesh, MaterialBuilder)>(pairs), mesh.Is16BitIndices(), meshData,
