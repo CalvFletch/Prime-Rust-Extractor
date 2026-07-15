@@ -2,6 +2,10 @@ using System.Net;
 using System.Text;
 using System.Text.Json;
 using AssetRipper.Assets;
+using AssetRipper.Assets.Bundles;
+using AssetRipper.Assets.Collections;
+using AssetRipper.Import.AssetCreation;
+using AssetRipper.IO.Files.CompressedFiles;
 using AssetRipper.Export.Configuration;
 using AssetRipper.Export.UnityProjects;
 using AssetRipper.Import.Logging;
@@ -196,14 +200,14 @@ internal static class Cli
 
     /// <summary>
     /// If the target references assets in unloaded bundles (meshes, materials,
-    /// textures), restart the session with exactly those bundles added. Iterates
-    /// because newly loaded assets can reveal further dependencies (a skinned
-    /// mesh bundle brings materials whose textures live in a third bundle).
+    /// textures), load exactly those bundles INTO the live session - no session
+    /// restart, no reprocessing. Iterates because newly loaded assets can
+    /// reveal further dependencies (a skinned mesh bundle brings materials
+    /// whose textures live in a third bundle).
     /// </summary>
     internal static Session EnsureTextures(Session session, string query, List<string> extraBundles)
     {
-        var loaded = extraBundles;
-        for (var pass = 0; pass < 3; pass++)
+        for (var pass = 0; pass < 4; pass++)
         {
             var resolved = session.ResolveExportSet(query);
             if (resolved == null)
@@ -215,9 +219,9 @@ internal static class Cli
             {
                 return session;
             }
-            Console.WriteLine($"dependency closure (pass {pass + 1}): loading {missing.Count} additional bundle(s): {string.Join(", ", missing.Select(Path.GetFileName))}");
-            loaded = loaded.Concat(missing).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-            session = Session.Start(loaded) ?? session;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            session.AddBundles(missing);
+            Console.WriteLine($"dependency closure (pass {pass + 1}): {missing.Count} bundle(s) added in {sw.Elapsed.TotalSeconds:F1}s: {string.Join(", ", missing.Select(Path.GetFileName))}");
         }
         return session;
     }
@@ -489,6 +493,75 @@ internal sealed class Session
         GameData gameData = handler.LoadAndProcess(loadPaths, LocalFileSystem.Instance);
         Console.WriteLine($"session loaded in {sw.Elapsed.TotalSeconds:F1}s ({loadPaths.Count} bundles)");
         return new Session { GameData = gameData, Catalog = catalog, Index = index, LoadedBundles = loadPaths };
+    }
+
+    /// <summary>
+    /// Load bundle files into the LIVE session. New collections get their
+    /// dependency lists initialized normally; pre-existing collections have
+    /// null slots where a dependency wasn't loaded at the time - those are
+    /// patched from our BundleIndex dependency tables (same ordered list the
+    /// game serialized). No session restart, no reprocessing: prefab roots and
+    /// processing passes from the initial load stay valid.
+    /// </summary>
+    public void AddBundles(List<string> paths)
+    {
+        var factory = new GameAssetFactory(GameData.AssemblyManager);
+        var newCollections = new List<SerializedAssetCollection>();
+        foreach (var path in paths)
+        {
+            AssetRipper.IO.Files.FileBase file;
+            try
+            {
+                file = AssetRipper.IO.Files.SchemeReader.LoadFile(path, LocalFileSystem.Instance);
+                file.ReadContentsRecursively();
+            }
+            catch (Exception ex)
+            {
+                Logger.Error($"failed to load {path}: {ex.Message}");
+                continue;
+            }
+            while (file is CompressedFile compressed)
+            {
+                file = compressed.UncompressedFile;
+            }
+            if (file is AssetRipper.IO.Files.FileContainer container)
+            {
+                var serializedBundle = SerializedBundle.FromFileContainer(container, factory);
+                GameData.GameBundle.AddBundle(serializedBundle);
+                newCollections.AddRange(serializedBundle.FetchAssetCollections().OfType<SerializedAssetCollection>());
+                LoadedBundles.Add(path);
+            }
+            else
+            {
+                Logger.Error($"not a bundle container: {path}");
+            }
+        }
+
+        foreach (var collection in newCollections)
+        {
+            collection.InitializeDependencyList(null);
+        }
+
+        // patch older collections' unresolved slots now that new CABs exist
+        var byName = GameData.GameBundle.FetchAssetCollections()
+            .GroupBy(c => c.Name, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
+        foreach (var collection in GameData.GameBundle.FetchAssetCollections().OfType<SerializedAssetCollection>().ToList())
+        {
+            string[]? deps = null;
+            for (var i = 1; i < collection.Dependencies.Count; i++)
+            {
+                if (collection.Dependencies[i] is not null)
+                {
+                    continue;
+                }
+                deps ??= Index.GetDependencies(collection.Name);
+                if (i - 1 < deps.Length && byName.TryGetValue(deps[i - 1], out var resolvedCollection))
+                {
+                    collection.SetDependency(i, resolvedCollection);
+                }
+            }
+        }
     }
 
     /// <summary>

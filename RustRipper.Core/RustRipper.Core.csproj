@@ -14,6 +14,8 @@
   <ItemGroup>
     <!-- GlbSubMeshBuilder / GlbCoordinateConversion are internal to the engine's model export module -->
     <Publicize Include="AssetRipper.Export.Modules.Models" />
+    <!-- incremental bundle loading needs InitializeDependencyList / SetDependency -->
+    <Publicize Include="AssetRipper.Assets" />
   </ItemGroup>
 
   <PropertyGroup>
