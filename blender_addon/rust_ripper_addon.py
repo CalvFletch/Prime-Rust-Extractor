@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Rust Ripper",
     "author": "Rust Ripper",
-    "version": (0, 1, 1),
+    "version": (0, 1, 2),
     "blender": (4, 2, 0),
     "location": "3D Viewport > Sidebar > Rust",
     "description": "Import Rust Ripper GLB exports: correct visibility, paint controls, light tools, daemon search",
@@ -40,6 +40,10 @@ class RustRipperSettings(bpy.types.PropertyGroup):
         name="Light Power",
         description="Scale factor applied to imported light energy",
         default=1.0, min=0.0, max=100.0)
+    tidy_nodes: BoolProperty(
+        name="Tidy node layouts",
+        description="Auto-arrange material nodes left-to-right after import (no stacked nodes)",
+        default=True)
 
 
 # ---------------------------------------------------------------- core
@@ -135,6 +139,219 @@ def _build_paint_nodes(glb_path, materials):
     return built
 
 
+# ------------------------------------------------- blend layer (compiled-shader curve)
+
+def _texture_entry(mat, slot):
+    """unity_textures extras entry {name, scale, offset} for a slot, or None."""
+    textures = mat.get("unity_textures")
+    entry = textures.get(slot) if textures is not None and hasattr(textures, "get") else None
+    return dict(entry) if entry is not None and hasattr(entry, "keys") else None
+
+
+def _sidecar_path(glb_path, texture_name):
+    path = f"{os.path.splitext(glb_path)[0]}.{texture_name}.png"
+    return path if os.path.exists(path) else None
+
+
+def _material_color_attributes(mat, objects):
+    """Colour attribute names present on the imported meshes using this material."""
+    names = set()
+    for obj in objects:
+        if obj.type == "MESH" and any(slot.material is mat for slot in obj.material_slots):
+            names |= {a.name for a in obj.data.color_attributes}
+    return names
+
+
+def _build_blend_layer_nodes(glb_path, materials, objects):
+    """Rust/Standard Blend Layer compositing, using the exact curve read from
+    the game's compiled fragment programs (docs/OUTPUT_CONTRACT.md):
+
+        weight = vertexColour.a (or .r, per _DetailBlendMaskVertexSource)
+        blend  = min(1, (weight * mask.G * (_DetailBlendFactor + 1)) ** _DetailBlendFalloff)
+        base   = lerp(base, detailAlbedo * tint, blend)
+
+    Everything comes from shipped data: material extras + sidecar textures.
+    """
+    built = 0
+    for mat in materials:
+        if not mat or not mat.use_nodes:
+            continue
+        floats = mat.get("unity_floats")
+        if floats is None or floats.get("_DetailBlendLayer", 0.0) != 1.0:
+            continue
+        mask_entry = _texture_entry(mat, "_DetailBlendMaskMap")
+        detail_entry = _texture_entry(mat, "_DetailAlbedoMap")
+        mask_path = mask_entry and _sidecar_path(glb_path, mask_entry["name"])
+        detail_path = detail_entry and _sidecar_path(glb_path, detail_entry["name"])
+        if not mask_path or not detail_path:
+            continue
+        tree = mat.node_tree
+        bsdf = next((n for n in tree.nodes if n.type == "BSDF_PRINCIPLED"), None)
+        if bsdf is None:
+            continue
+        attrs = _material_color_attributes(mat, objects)
+        nodes, links = tree.nodes, tree.links
+
+        def image_node(path, label, non_color):
+            img = bpy.data.images.load(path, check_existing=True)
+            if non_color:
+                img.colorspace_settings.name = "Non-Color"
+            node = nodes.new("ShaderNodeTexImage")
+            node.image = img
+            node.label = label
+            return node
+
+        def math_node(op, label, second=None):
+            node = nodes.new("ShaderNodeMath")
+            node.operation = op
+            node.label = label
+            if second is not None:
+                node.inputs[1].default_value = second
+            return node
+
+        def value_node(name):
+            node = nodes.new("ShaderNodeValue")
+            node.outputs[0].default_value = floats.get(name, 0.0)
+            node.label = f"{name} (data)"
+            return node
+
+        mask_node = image_node(mask_path, "_DetailBlendMaskMap", non_color=True)
+        if floats.get("_DetailBlendMaskAddLowFreq", 0.0) != 0.0:
+            mask_node.label += " (AddLowFreq second sample not built)"
+
+        sep = nodes.new("ShaderNodeSeparateColor")
+        sep.label = "mask green (shader reads .g)"
+        links.new(mask_node.outputs["Color"], sep.inputs["Color"])
+        weight_socket = sep.outputs["Green"]
+
+        if floats.get("_DetailBlendMaskMapInvert", 0.0) != 0.0:
+            invert = math_node("SUBTRACT", "_DetailBlendMaskMapInvert")
+            invert.inputs[0].default_value = 1.0
+            links.new(weight_socket, invert.inputs[1])
+            weight_socket = invert.outputs[0]
+
+        # meshes without a colour stream read (1,1,1,1) in Unity: skip the multiply
+        if "_RUST_COLOR" in attrs:
+            vcol = nodes.new("ShaderNodeVertexColor")
+            vcol.layer_name = "_RUST_COLOR"
+            vcol.label = "vertex colour (blend weight)"
+            if floats.get("_DetailBlendMaskVertexSource", 0.0) == 0.0:
+                weight_out = vcol.outputs["Alpha"]
+            else:
+                vsep = nodes.new("ShaderNodeSeparateColor")
+                vsep.label = "_DetailBlendMaskVertexSource=1 (red)"
+                links.new(vcol.outputs["Color"], vsep.inputs["Color"])
+                weight_out = vsep.outputs["Red"]
+            weighted = math_node("MULTIPLY", "mask x vertex weight")
+            links.new(weight_socket, weighted.inputs[0])
+            links.new(weight_out, weighted.inputs[1])
+            weight_socket = weighted.outputs[0]
+
+        factor = value_node("_DetailBlendFactor")
+        falloff = value_node("_DetailBlendFalloff")
+        gain = math_node("ADD", "_DetailBlendFactor + 1", 1.0)
+        links.new(factor.outputs[0], gain.inputs[0])
+        gained = math_node("MULTIPLY", "x (_DetailBlendFactor + 1)")
+        links.new(weight_socket, gained.inputs[0])
+        links.new(gain.outputs[0], gained.inputs[1])
+        curved = math_node("POWER", "^ _DetailBlendFalloff")
+        links.new(gained.outputs[0], curved.inputs[0])
+        links.new(falloff.outputs[0], curved.inputs[1])
+        clamped = math_node("MINIMUM", "min 1 (saturate)", 1.0)
+        links.new(curved.outputs[0], clamped.inputs[0])
+
+        detail_node = image_node(detail_path, "_DetailAlbedoMap", non_color=False)
+        scale = list(detail_entry.get("scale", [1.0, 1.0]))
+        offset = list(detail_entry.get("offset", [0.0, 0.0]))
+        if scale != [1.0, 1.0] or offset != [0.0, 0.0]:
+            mapping = nodes.new("ShaderNodeMapping")
+            mapping.label = "_DetailAlbedoMap tiling (data)"
+            mapping.inputs["Scale"].default_value = (scale[0], scale[1], 1.0)
+            mapping.inputs["Location"].default_value = (offset[0], offset[1], 0.0)
+            uv = nodes.new("ShaderNodeUVMap")
+            links.new(uv.outputs["UV"], mapping.inputs["Vector"])
+            links.new(mapping.outputs["Vector"], detail_node.inputs["Vector"])
+
+        if "_RUST_CUSTOMCOLOUR_01" in attrs:
+            tint = nodes.new("ShaderNodeVertexColor")
+            tint.layer_name = "_RUST_CUSTOMCOLOUR_01"
+            tint.label = "customColour 01 (swap layer for other palette entries)"
+            tint_socket = tint.outputs["Color"]
+        elif "_RUST_DETAILCOLOR" in attrs:
+            tint = nodes.new("ShaderNodeVertexColor")
+            tint.layer_name = "_RUST_DETAILCOLOR"
+            tint.label = "_DetailColor (authored)"
+            tint_socket = tint.outputs["Color"]
+        else:
+            tint = nodes.new("ShaderNodeRGB")
+            colors = mat.get("unity_colors")
+            authored = list(colors.get("_DetailColor", [1.0, 1.0, 1.0, 1.0])) if colors is not None else [1.0, 1.0, 1.0, 1.0]
+            tint.outputs[0].default_value = (*authored[:3], 1.0)
+            tint.label = "_DetailColor (as authored)"
+            tint_socket = tint.outputs[0]
+
+        tinted = nodes.new("ShaderNodeMix")
+        tinted.data_type = "RGBA"
+        tinted.blend_type = "MULTIPLY"
+        tinted.inputs[0].default_value = 1.0
+        tinted.label = "detail layer (albedo x colour)"
+        links.new(detail_node.outputs["Color"], tinted.inputs[6])
+        links.new(tint_socket, tinted.inputs[7])
+
+        blend = nodes.new("ShaderNodeMix")
+        blend.data_type = "RGBA"
+        blend.blend_type = "MIX"
+        blend.label = "blend by _DetailBlendMaskMap"
+        base_input = bsdf.inputs["Base Color"]
+        if base_input.is_linked:
+            links.new(base_input.links[0].from_socket, blend.inputs[6])
+        else:
+            blend.inputs[6].default_value = base_input.default_value
+        links.new(tinted.outputs[2], blend.inputs[7])
+        links.new(clamped.outputs[0], blend.inputs[0])
+        links.new(blend.outputs[2], base_input)
+        built += 1
+    return built
+
+
+# ------------------------------------------------------------- node layout
+
+_NODE_HEIGHT = {
+    "TEX_IMAGE": 290, "BSDF_PRINCIPLED": 640, "MIX": 190, "MATH": 160,
+    "VALUE": 90, "RGB": 200, "SEPARATE_COLOR": 130, "NORMAL_MAP": 170,
+    "MAPPING": 330, "UVMAP": 100, "VERTEX_COLOR": 120, "GROUP": 240,
+    "OUTPUT_MATERIAL": 110,
+}
+
+
+def _arrange_nodes(tree):
+    """Deterministic left-to-right layout: column = distance to the output
+    side, rows barycenter-sorted so links stay short. No overlaps, ever."""
+    nodes = [n for n in tree.nodes if n.type != "FRAME"]
+    depth = {n: 0 for n in nodes}
+    for _ in range(len(nodes)):
+        changed = False
+        for link in tree.links:
+            a, b = link.from_node, link.to_node
+            if a in depth and b in depth and depth[a] < depth[b] + 1:
+                depth[a] = depth[b] + 1
+                changed = True
+        if not changed:
+            break
+    columns = {}
+    for node in nodes:
+        columns.setdefault(depth[node], []).append(node)
+    for d in sorted(columns):
+        def barycenter(node):
+            ys = [l.to_node.location.y for s in node.outputs for l in s.links]
+            return -sum(ys) / len(ys) if ys else 0.0
+        column = sorted(columns[d], key=barycenter)
+        y = 0.0
+        for node in column:
+            node.location = (-d * 340.0, y)
+            y -= _NODE_HEIGHT.get(node.type, 160) + 40.0
+
+
 def _import_glb(context, filepath):
     settings = context.scene.rust_ripper
     before_objects = set(bpy.data.objects)
@@ -144,6 +361,11 @@ def _import_glb(context, filepath):
     new_materials = [m for m in bpy.data.materials if m not in before_materials]
     hidden, reused = _post_process(new_objects, settings)
     painted = _build_paint_nodes(filepath, new_materials)
+    painted += _build_blend_layer_nodes(filepath, new_materials, new_objects)
+    if settings.tidy_nodes:
+        for mat in new_materials:
+            if mat.use_nodes:
+                _arrange_nodes(mat.node_tree)
     return len(new_objects), hidden, painted, reused
 
 
@@ -256,6 +478,7 @@ class RUST_PT_main(bpy.types.Panel):
         layout.prop(settings, "auto_hide")
         layout.prop(settings, "reuse_meshes")
         layout.prop(settings, "light_power_scale")
+        layout.prop(settings, "tidy_nodes")
 
 
 class RUST_PT_lights(bpy.types.Panel):
