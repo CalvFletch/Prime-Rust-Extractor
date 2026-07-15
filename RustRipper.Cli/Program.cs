@@ -365,6 +365,10 @@ internal static class Cli
                     case "/matscan":
                         WriteJson(context, 200, new { report = session.MatScan() });
                         break;
+                    case "/hier":
+                        var hierReport = session.HierarchyReport(q);
+                        WriteJson(context, hierReport != null ? 200 : 404, new { report = hierReport });
+                        break;
                     default:
                         WriteJson(context, 404, new { error = "unknown endpoint" });
                         break;
@@ -873,6 +877,54 @@ internal sealed class Session
                 }
             }
         }
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Full prefab hierarchy with every component (MonoBehaviours by script
+    /// class name). The go-to probe for "which component claims this
+    /// renderer" questions.
+    /// </summary>
+    public string? HierarchyReport(string query)
+    {
+        var resolved = ResolveExportSet(query);
+        if (resolved == null)
+        {
+            return null;
+        }
+        var sb = new StringBuilder();
+        sb.AppendLine($"=== hierarchy for {resolved.Value.Name} ===");
+        void Walk(AssetRipper.SourceGenerated.Classes.ClassID_4.ITransform transform, int depth)
+        {
+            if (transform.GameObject_C4P is not { } gameObject)
+            {
+                return;
+            }
+            var components = new List<string>();
+            foreach (var componentPtr in gameObject.FetchComponents())
+            {
+                var component = componentPtr.TryGetAsset(gameObject.Collection);
+                var label = component switch
+                {
+                    null => "?missing",
+                    IMonoBehaviour monoBehaviour => $"MB:{monoBehaviour.ScriptP?.ClassName_R.String ?? "?"}",
+                    _ => component.ClassName,
+                };
+                if (label != "Transform")
+                {
+                    components.Add(label);
+                }
+            }
+            sb.AppendLine($"{new string(' ', depth * 2)}{gameObject.Name.String}  [{string.Join(", ", components)}]");
+            foreach (var child in transform.Children_C4P)
+            {
+                if (child is not null)
+                {
+                    Walk(child, depth + 1);
+                }
+            }
+        }
+        Walk(resolved.Value.Root.GetTransform(), 0);
         return sb.ToString();
     }
 
