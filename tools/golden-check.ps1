@@ -70,6 +70,13 @@ Assert "wall: no invented bake (raw albedo)"   (-not ($g.images | Where-Object {
 Assert "wall: blend mask sidecar"              (Test-Path (Join-Path (Split-Path $wallPath) "wall.container.full.shipping_container_mask.png"))
 Assert "wall: tint map sidecar"                (Test-Path (Join-Path (Split-Path $wallPath) "wall.container.full.shipping_container_color_lookup.png"))
 
+# --- helipad: numbered blend layers (Blend 4-Way) ship sidecars ---
+$hpPath = Export-Asset "helipad"
+$g = Get-GlbJson $hpPath
+Assert "helipad: 4-way material present"  (($g.materials | Where-Object { $_.extras.unity_shader -like "*Blend 4-Way*" }).Count -ge 1)
+Assert "helipad: layer blend mask sidecar" (Test-Path (Join-Path (Split-Path $hpPath) "helipad.metal_grate_mask.png"))
+Assert "helipad: layer albedo sidecar"     (Test-Path (Join-Path (Split-Path $hpPath) "helipad.metal_grate_bc2.png"))
+
 # --- barrel: detail paint baked + paint attribute ---
 $g = Get-GlbJson (Export-Asset "loot-barrel-1")
 Assert "barrel: detail tint baked image"     (($g.images | Where-Object { $_.name -like "*_detailtint" }))

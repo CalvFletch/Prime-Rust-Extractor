@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Rust Ripper",
     "author": "Rust Ripper",
-    "version": (0, 1, 4),
+    "version": (0, 1, 5),
     "blender": (4, 2, 0),
     "location": "3D Viewport > Sidebar > Rust",
     "description": "Import Rust Ripper GLB exports: correct visibility, paint controls, light tools, daemon search",
@@ -381,6 +381,216 @@ def _build_blend_layer_nodes(glb_path, materials, objects):
     return built
 
 
+_BLEND4WAY_GROUP = "Rust/Standard Blend 4-Way (layer)"
+
+
+def _blend4way_group():
+    """One application of a numbered blend layer, chainable Color->Color.
+    Curve read from the compiled 4-Way fragment programs - identical to the
+    Blend Layer curve; weights come from vertex COLOR r/g/b per layer:
+
+        blend = min(1, (weight * mask.G * (_BlendFactor + 1)) ** _BlendFalloff)
+        layer = _AlbedoTintMask ? lerp(albedo, albedo * color, albedo.a)
+                                : albedo * color
+        out   = lerp(base, layer, blend)
+    """
+    group = bpy.data.node_groups.get(_BLEND4WAY_GROUP)
+    if group is not None and group.get("rust_ripper_version", 0) >= 1:
+        return group
+    if group is None:
+        group = bpy.data.node_groups.new(_BLEND4WAY_GROUP, "ShaderNodeTree")
+    group["rust_ripper_version"] = 1
+    group.use_fake_user = True
+
+    present = {(item.name, item.in_out) for item in group.interface.items_tree
+               if getattr(item, "in_out", None)}
+
+    def socket(name, in_out, socket_type, default=None):
+        if (name, in_out) in present:
+            return
+        item = group.interface.new_socket(name=name, in_out=in_out, socket_type=socket_type)
+        if default is not None:
+            item.default_value = default
+
+    socket("Base Color", "INPUT", "NodeSocketColor", (0.8, 0.8, 0.8, 1.0))
+    socket("Layer Albedo", "INPUT", "NodeSocketColor", (1.0, 1.0, 1.0, 1.0))
+    socket("Layer Albedo Alpha", "INPUT", "NodeSocketFloat", 1.0)
+    socket("Layer Color", "INPUT", "NodeSocketColor", (1.0, 1.0, 1.0, 1.0))
+    socket("_AlbedoTintMask", "INPUT", "NodeSocketFloat", 0.0)
+    socket("Mask", "INPUT", "NodeSocketColor", (1.0, 1.0, 1.0, 1.0))
+    socket("Weight", "INPUT", "NodeSocketFloat", 1.0)
+    socket("_BlendFactor", "INPUT", "NodeSocketFloat", 8.0)
+    socket("_BlendFalloff", "INPUT", "NodeSocketFloat", 1.0)
+    socket("_BlendMaskMapInvert", "INPUT", "NodeSocketFloat", 0.0)
+    socket("Color", "OUTPUT", "NodeSocketColor")
+    socket("Blend Factor", "OUTPUT", "NodeSocketFloat")
+
+    nodes, links = group.nodes, group.links
+    nodes.clear()
+    group_in = nodes.new("NodeGroupInput")
+    group_out = nodes.new("NodeGroupOutput")
+
+    def math(op, label, first=None, second=None):
+        node = nodes.new("ShaderNodeMath")
+        node.operation = op
+        node.label = label
+        if first is not None:
+            node.inputs[0].default_value = first
+        if second is not None:
+            node.inputs[1].default_value = second
+        return node
+
+    def mix_rgba(blend_type, label):
+        node = nodes.new("ShaderNodeMix")
+        node.data_type = "RGBA"
+        node.blend_type = blend_type
+        node.label = label
+        return node
+
+    sep = nodes.new("ShaderNodeSeparateColor")
+    sep.label = "mask green (shader reads .g)"
+    links.new(group_in.outputs["Mask"], sep.inputs["Color"])
+
+    inverted = math("SUBTRACT", "1 - mask", first=1.0)
+    links.new(sep.outputs["Green"], inverted.inputs[1])
+    pick = nodes.new("ShaderNodeMix")
+    pick.data_type = "FLOAT"
+    pick.label = "_BlendMaskMapInvert switch"
+    links.new(group_in.outputs["_BlendMaskMapInvert"], pick.inputs[0])
+    links.new(sep.outputs["Green"], pick.inputs[2])
+    links.new(inverted.outputs[0], pick.inputs[3])
+
+    weighted = math("MULTIPLY", "mask x vertex weight")
+    links.new(pick.outputs[0], weighted.inputs[0])
+    links.new(group_in.outputs["Weight"], weighted.inputs[1])
+
+    gain = math("ADD", "_BlendFactor + 1", second=1.0)
+    links.new(group_in.outputs["_BlendFactor"], gain.inputs[0])
+    gained = math("MULTIPLY", "x (_BlendFactor + 1)")
+    links.new(weighted.outputs[0], gained.inputs[0])
+    links.new(gain.outputs[0], gained.inputs[1])
+    curved = math("POWER", "^ _BlendFalloff")
+    links.new(gained.outputs[0], curved.inputs[0])
+    links.new(group_in.outputs["_BlendFalloff"], curved.inputs[1])
+    clamped = math("MINIMUM", "min 1 (saturate)", second=1.0)
+    links.new(curved.outputs[0], clamped.inputs[0])
+
+    tint_full = mix_rgba("MULTIPLY", "albedo x _Color")
+    tint_full.inputs[0].default_value = 1.0
+    links.new(group_in.outputs["Layer Albedo"], tint_full.inputs[6])
+    links.new(group_in.outputs["Layer Color"], tint_full.inputs[7])
+
+    tint_masked = mix_rgba("MIX", "tint through albedo alpha")
+    links.new(group_in.outputs["Layer Albedo Alpha"], tint_masked.inputs[0])
+    links.new(group_in.outputs["Layer Albedo"], tint_masked.inputs[6])
+    links.new(tint_full.outputs[2], tint_masked.inputs[7])
+
+    tint_pick = mix_rgba("MIX", "_AlbedoTintMask switch")
+    links.new(group_in.outputs["_AlbedoTintMask"], tint_pick.inputs[0])
+    links.new(tint_full.outputs[2], tint_pick.inputs[6])
+    links.new(tint_masked.outputs[2], tint_pick.inputs[7])
+
+    blend = mix_rgba("MIX", "blend layer")
+    links.new(clamped.outputs[0], blend.inputs[0])
+    links.new(group_in.outputs["Base Color"], blend.inputs[6])
+    links.new(tint_pick.outputs[2], blend.inputs[7])
+
+    links.new(blend.outputs[2], group_out.inputs["Color"])
+    links.new(clamped.outputs[0], group_out.inputs["Blend Factor"])
+    _arrange_nodes(group)
+    return group
+
+
+def _build_blend4way_nodes(glb_path, materials, objects):
+    """Numbered blend layers (_BlendLayer1..3): chain one group instance per
+    enabled layer; weights are vertex COLOR r/g/b, all values from data."""
+    built = 0
+    for mat in materials:
+        if not mat or not mat.use_nodes:
+            continue
+        floats = mat.get("unity_floats")
+        if floats is None:
+            continue
+        layers = []
+        for n in (1, 2, 3):
+            if floats.get(f"_BlendLayer{n}", 0.0) != 1.0:
+                continue
+            albedo_entry = _texture_entry(mat, f"_BlendLayer{n}_AlbedoMap")
+            mask_entry = _texture_entry(mat, f"_BlendLayer{n}_BlendMaskMap")
+            albedo_path = albedo_entry and _sidecar_path(glb_path, albedo_entry["name"])
+            mask_path = mask_entry and _sidecar_path(glb_path, mask_entry["name"])
+            if albedo_path and mask_path:
+                layers.append((n, albedo_entry, albedo_path, mask_path))
+        if not layers:
+            continue
+        tree = mat.node_tree
+        bsdf = next((n for n in tree.nodes if n.type == "BSDF_PRINCIPLED"), None)
+        if bsdf is None:
+            continue
+        attrs = _material_color_attributes(mat, objects)
+        nodes, links = tree.nodes, tree.links
+        colors = mat.get("unity_colors")
+
+        weight_sep = None
+        if "_RUST_COLOR" in attrs:
+            vcol = nodes.new("ShaderNodeVertexColor")
+            vcol.layer_name = "_RUST_COLOR"
+            vcol.label = "vertex colour (layer weights r/g/b)"
+            weight_sep = nodes.new("ShaderNodeSeparateColor")
+            weight_sep.label = "layer weights"
+            links.new(vcol.outputs["Color"], weight_sep.inputs["Color"])
+
+        base_input = bsdf.inputs["Base Color"]
+        chain_socket = base_input.links[0].from_socket if base_input.is_linked else None
+        for n, albedo_entry, albedo_path, mask_path in layers:
+            layer = nodes.new("ShaderNodeGroup")
+            layer.node_tree = _blend4way_group()
+            layer.label = f"_BlendLayer{n}"
+            layer.inputs["_BlendFactor"].default_value = floats.get(f"_BlendLayer{n}_BlendFactor", 8.0)
+            layer.inputs["_BlendFalloff"].default_value = floats.get(f"_BlendLayer{n}_BlendFalloff", 1.0)
+            layer.inputs["_BlendMaskMapInvert"].default_value = floats.get(f"_BlendLayer{n}_BlendMaskMapInvert", 0.0)
+            layer.inputs["_AlbedoTintMask"].default_value = floats.get(f"_BlendLayer{n}_AlbedoTintMask", 0.0)
+            if colors is not None:
+                authored = list(colors.get(f"_BlendLayer{n}_Color", [1.0, 1.0, 1.0, 1.0]))
+                layer.inputs["Layer Color"].default_value = (*[c ** 2.2 for c in authored[:3]], 1.0)
+
+            img = bpy.data.images.load(albedo_path, check_existing=True)
+            albedo_node = nodes.new("ShaderNodeTexImage")
+            albedo_node.image = img
+            albedo_node.label = f"_BlendLayer{n}_AlbedoMap"
+            scale = list(albedo_entry.get("scale", [1.0, 1.0]))
+            offset = list(albedo_entry.get("offset", [0.0, 0.0]))
+            if scale != [1.0, 1.0] or offset != [0.0, 0.0]:
+                mapping = nodes.new("ShaderNodeMapping")
+                mapping.label = f"_BlendLayer{n} tiling (data)"
+                mapping.inputs["Scale"].default_value = (scale[0], scale[1], 1.0)
+                mapping.inputs["Location"].default_value = (offset[0], offset[1], 0.0)
+                uv = nodes.new("ShaderNodeUVMap")
+                links.new(uv.outputs["UV"], mapping.inputs["Vector"])
+                links.new(mapping.outputs["Vector"], albedo_node.inputs["Vector"])
+            links.new(albedo_node.outputs["Color"], layer.inputs["Layer Albedo"])
+            links.new(albedo_node.outputs["Alpha"], layer.inputs["Layer Albedo Alpha"])
+
+            mask_img = bpy.data.images.load(mask_path, check_existing=True)
+            mask_img.colorspace_settings.name = "Non-Color"
+            mask_node = nodes.new("ShaderNodeTexImage")
+            mask_node.image = mask_img
+            mask_node.label = f"_BlendLayer{n}_BlendMaskMap"
+            links.new(mask_node.outputs["Color"], layer.inputs["Mask"])
+
+            if weight_sep is not None:
+                links.new(weight_sep.outputs[("Red", "Green", "Blue")[n - 1]], layer.inputs["Weight"])
+
+            if chain_socket is not None:
+                links.new(chain_socket, layer.inputs["Base Color"])
+            else:
+                layer.inputs["Base Color"].default_value = base_input.default_value
+            chain_socket = layer.outputs["Color"]
+        links.new(chain_socket, base_input)
+        built += 1
+    return built
+
+
 # ------------------------------------------------------------- node layout
 
 _NODE_HEIGHT = {
@@ -461,6 +671,7 @@ def _import_glb(context, filepath):
     hidden, reused = _post_process(new_objects, settings)
     painted = _build_paint_nodes(filepath, new_materials)
     painted += _build_blend_layer_nodes(filepath, new_materials, new_objects)
+    painted += _build_blend4way_nodes(filepath, new_materials, new_objects)
     if settings.tidy_nodes:
         for mat in new_materials:
             if mat.use_nodes:

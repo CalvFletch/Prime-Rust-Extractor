@@ -159,11 +159,23 @@ public class RipperMaterialFactory
         // (compiled as _DETAILBLENDLAYER_ON) - same mechanism, separate switch
         var blendLayerOn = profile.SupportsDetailPaint
             && floats.TryGetValue("_DetailBlendLayer", out var blendLayer) && blendLayer != 0f;
+        // the 4-Way family numbers its layers: _BlendLayer1..3 switches with
+        // per-layer albedo/mask/normal/specgloss slots - same delivery need
+        var numberedLayerOn = false;
+        if (profile.SupportsDetailPaint)
+        {
+            for (int layerIndex = 1; layerIndex <= 3 && !numberedLayerOn; layerIndex++)
+            {
+                numberedLayerOn = floats.TryGetValue($"_BlendLayer{layerIndex}", out var numberedLayer)
+                    && numberedLayer != 0f
+                    && GetTexture(material, $"_BlendLayer{layerIndex}_AlbedoMap") is not null;
+            }
+        }
         var detailTintActive = detailLayerOn
             && detailMask is not null
             && detailAlbedo is null
             && colors.TryGetValue("_DetailColor", out var detailColor);
-        if ((detailLayerOn || blendLayerOn) && detailAlbedo is not null)
+        if (((detailLayerOn || blendLayerOn) && detailAlbedo is not null) || numberedLayerOn)
         {
             // detail ALBEDO present: the layer composites per-pixel (its own
             // texture set, mask, tiling; colour authored or runtime-supplied) -
