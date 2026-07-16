@@ -171,11 +171,18 @@ public class RipperMaterialFactory
                     && GetTexture(material, $"_BlendLayer{layerIndex}_AlbedoMap") is not null;
             }
         }
+        // terrain blending composites against per-map world state (splat
+        // controls, biome, texture arrays) and cannot be reproduced statically;
+        // the material's own blend mask ships so consumers know WHERE the
+        // terrain coat would appear
+        var terrainLayerOn = profile.SupportsDetailPaint
+            && floats.TryGetValue("_TerrainLayer", out var terrainLayer) && terrainLayer != 0f
+            && GetTexture(material, "_TerrainLayer_BlendMask") is not null;
         var detailTintActive = detailLayerOn
             && detailMask is not null
             && detailAlbedo is null
             && colors.TryGetValue("_DetailColor", out var detailColor);
-        if (((detailLayerOn || blendLayerOn) && detailAlbedo is not null) || numberedLayerOn)
+        if (((detailLayerOn || blendLayerOn) && detailAlbedo is not null) || numberedLayerOn || terrainLayerOn)
         {
             // detail ALBEDO present: the layer composites per-pixel (its own
             // texture set, mask, tiling; colour authored or runtime-supplied) -

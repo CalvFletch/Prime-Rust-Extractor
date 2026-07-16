@@ -188,6 +188,11 @@ public static class ShaderBlobDump
                     offsetsByName.TryAdd(name, new HashSet<int>());
                     offsetsByName[name].Add(offset);
                 }
+                foreach (var (name, slot) in CollectCommonTextures(shader))
+                {
+                    slotsByTexture.TryAdd(name, new HashSet<int>());
+                    slotsByTexture[name].Add(slot);
+                }
                 globalsUnion = new
                 {
                     platform = platformName,
@@ -403,6 +408,41 @@ public static class ShaderBlobDump
             written,
             notes,
         };
+    }
+
+    /// <summary>(name, slot) texture pairs from every pass's CommonParameters.</summary>
+    private static IEnumerable<(string Name, int Slot)> CollectCommonTextures(IShader shader)
+    {
+        var results = new List<(string, int)>();
+        try
+        {
+            foreach (var subShader in shader.ParsedForm.SubShaders)
+            {
+                foreach (var pass in subShader.Passes)
+                {
+                    var names = new Dictionary<int, string>();
+                    foreach (var pair in pass.NameIndices)
+                    {
+                        names[pair.Value] = pair.Key.String;
+                    }
+                    foreach (var prog in new[] { pass.ProgVertex, pass.ProgFragment })
+                    {
+                        if (prog?.CommonParameters is not { } common)
+                        {
+                            continue;
+                        }
+                        foreach (var t in common.TextureParams.Cast<ITextureParameter>())
+                        {
+                            results.Add((names.GetValueOrDefault(t.NameIndex, $"#{t.NameIndex}"), t.Index));
+                        }
+                    }
+                }
+            }
+        }
+        catch
+        {
+        }
+        return results;
     }
 
     /// <summary>(name, byteOffset) pairs from every pass's CommonParameters

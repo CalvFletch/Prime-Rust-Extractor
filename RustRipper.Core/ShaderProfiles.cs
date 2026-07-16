@@ -60,13 +60,20 @@ public static class ShaderProfiles
             "Standard",
             "Autodesk Interactive",
             "Rust/Standard Blend Layer",
+            "Rust/Standard Blend Layer (Specular setup)",
             "Rust/Standard Cloth",
             "Rust/Standard Cloth (Specular setup)",
             "Rust/Standard Decal",
             "Rust/Standard Decal (Specular setup)",
+            "Rust/Standard Decal (Poster)",
             "Rust/Standard + Wind",
             "Rust/Standard + Wind (Specular setup)",
             "Rust/Standard Terrain Blend (Specular setup)",
+            // program-verified (shaderdump): standard slots + numbered blend
+            // layers; the packed-mask macro system rides in extras
+            "Rust/Standard Packed Mask Blend",
+            "Developer/LocalCoord Diffuse (Specular Setup)",
+            "Developer/LocalCoord Diffuse (Metallic Setup)",
             "Custom/Standard Refraction",
             "Rust/Flare",
             "Particles/VertexLit Blended Custom",
@@ -104,7 +111,33 @@ public static class ShaderProfiles
         NormalSlots = ["_NormalMap", "_BumpMap"],
     };
 
-    public static readonly ShaderProfile[] All = [Standard, AnimalFur, CoreFoliage];
+    /// <summary>Projected decals. Slots read from the compiled programs
+    /// (shaderdump): _MainTex/_BumpMap/_SpecGlossMap/_EmissionMap plus a
+    /// dedicated _AlphaTex; the *Copy slots are gbuffer reads, not material
+    /// data. Statically a decal is its quad - blend state supplies alpha.</summary>
+    public static readonly ShaderProfile DeferredDecal = new()
+    {
+        Id = "deferred-decal",
+        Shaders = ["Decal/Deferred Decal"],
+        BaseColorSlots = ["_MainTex"],
+        NormalSlots = ["_BumpMap"],
+        SpecGlossSlots = ["_SpecGlossMap"],
+        EmissiveSlots = ["_EmissionMap"],
+    };
+
+    /// <summary>NPC/player skin. Slots read from the compiled programs:
+    /// _ScatterMap (subsurface), hair packed maps and detail rough/normal
+    /// have no glTF channel and ride in extras.</summary>
+    public static readonly ShaderProfile CoreSkin = new()
+    {
+        Id = "core-skin",
+        Shaders = ["Core/Skin"],
+        BaseColorSlots = ["_BaseColorMap"],
+        NormalSlots = ["_NormalMap"],
+        SpecGlossSlots = ["_SpecularMap"],
+    };
+
+    public static readonly ShaderProfile[] All = [Standard, AnimalFur, CoreFoliage, DeferredDecal, CoreSkin];
 
     private static readonly Dictionary<string, ShaderProfile> byShader = Build();
 
