@@ -798,11 +798,26 @@ def _import_glb(context, filepath):
     settings = context.scene.rust_ripper
     before_objects = set(bpy.data.objects)
     before_materials = set(bpy.data.materials)
+    before_actions = set(bpy.data.actions)
     bpy.ops.import_scene.gltf(filepath=filepath)
     new_objects = [o for o in bpy.data.objects if o not in before_objects]
     new_materials = [m for m in bpy.data.materials if m not in before_materials]
+    new_actions = [a for a in bpy.data.actions if a not in before_actions]
     hidden, reused = _post_process(new_objects, settings)
     _tidy_armatures(context, new_objects)
+    # namespace actions per import so every rig's clips are findable in the
+    # global action list ("wolf2|wolf_run", "chicken|walk")
+    root = next((o for o in new_objects if o.parent is None), None)
+    if root is not None:
+        prefix = root.name.split(".")[0]
+        for action in new_actions:
+            if "|" not in action.name:
+                action.name = f"{prefix}|{action.name}"
+    # animation-target empties are load-bearing (deleting them breaks clips):
+    # keep them visible but small
+    for obj in new_objects:
+        if obj.type == "EMPTY" and obj.get("unity_animated"):
+            obj.empty_display_size = 0.05
     painted = _build_paint_nodes(filepath, new_materials)
     painted += _build_blend_layer_nodes(filepath, new_materials, new_objects)
     painted += _build_blend4way_nodes(filepath, new_materials, new_objects)

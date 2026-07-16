@@ -375,6 +375,7 @@ public class RipperGlbBuilder
 
     private readonly HashSet<long> socketKeep = new();
     private readonly HashSet<long> boneKeep = new();
+    private readonly HashSet<long> animatedKeep = new();
     private readonly Dictionary<long, NodeBuilder> nodeByGameObject = new();
     private readonly List<(IMeshBuilder<MaterialBuilder> Mesh, NodeBuilder Node, ISkinnedMeshRenderer Renderer, MeshData Data)> pendingSkins = new();
 
@@ -383,7 +384,8 @@ public class RipperGlbBuilder
         || (options.IncludeLights && gameObject.TryGetComponent(out ILight? _))
         || options.ForceKeepPathIds.Contains(gameObject.PathID)
         || socketKeep.Contains(gameObject.PathID)
-        || boneKeep.Contains(gameObject.PathID);
+        || boneKeep.Contains(gameObject.PathID)
+        || animatedKeep.Contains(gameObject.PathID);
 
     /// <summary>Bones referenced by any skinned mesh keep their transforms:
     /// they are the glTF joints, so they are exempt from pruning and from
@@ -476,7 +478,7 @@ public class RipperGlbBuilder
                 {
                     if (pathMap.TryGetValue(path, out var target))
                     {
-                        boneKeep.Add(target.PathID);
+                        animatedKeep.Add(target.PathID);
                     }
                 }
             }
@@ -839,6 +841,12 @@ public class RipperGlbBuilder
         if (parentNode is null)
         {
             node.Extras["unity_prefab_path"] = gameObject.Name.String;
+        }
+        // kept because an AnimationClip animates this transform - consumers
+        // can display these small; deleting them breaks the animations
+        if (animatedKeep.Contains(gameObject.PathID))
+        {
+            node.Extras["unity_animated"] = true;
         }
         // hidden-in-game signals: inactive GameObject, or a non-default state
         // variant subtree (unlocked/blocked keypads). Roots are exempt: Rust
