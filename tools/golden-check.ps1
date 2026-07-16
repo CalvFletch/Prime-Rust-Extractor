@@ -59,6 +59,8 @@ Assert "wolf: fur material BLEND"            ($fur -and $fur.alphaMode -eq "BLEN
 Assert "wolf: animal-fur profile applied"    ($fur -and $fur.extras.rust_profile -eq "animal-fur")
 Assert "wolf: KHR specular on body"          (($g.materials | Where-Object { $_.name -eq "Wolf" }).extensions.KHR_materials_specular)
 Assert "wolf: _RUST_COLOR demotion"          (($g.meshes.primitives.attributes | Where-Object { $_._RUST_COLOR -ne $null }))
+Assert "wolf: glTF skins with joints"        ($g.skins.Count -ge 2 -and $g.skins[0].joints.Count -ge 30)
+Assert "wolf: JOINTS_0 on skinned mesh"      (($g.meshes.primitives.attributes | Where-Object { $_.JOINTS_0 -ne $null }).Count -ge 2)
 
 # --- container wall: runtime tint -> palette attributes from ColourLookup ---
 $wallPath = Export-Asset "wall.container.full"

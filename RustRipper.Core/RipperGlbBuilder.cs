@@ -103,9 +103,11 @@ public class RipperGlbBuilder
         builder.BuildNameConventionLodMembership(root);
         builder.BuildHiddenStateVariants(root);
         builder.BuildSocketForceKeep(root);
+        builder.BuildBoneKeep(root);
         builder.BuildKeepSet(root);
         var sceneBuilder = new SceneBuilder();
         builder.AddGameObject(sceneBuilder, null, root.GetTransform());
+        builder.FinishSkins(sceneBuilder);
         return sceneBuilder;
     }
 
@@ -360,12 +362,95 @@ public class RipperGlbBuilder
     }
 
     private readonly HashSet<long> socketKeep = new();
+    private readonly HashSet<long> boneKeep = new();
+    private readonly Dictionary<long, NodeBuilder> nodeByGameObject = new();
+    private readonly List<(IMeshBuilder<MaterialBuilder> Mesh, NodeBuilder Node, ISkinnedMeshRenderer Renderer, MeshData Data)> pendingSkins = new();
 
     private bool Contributes(IGameObject gameObject)
         => EmitsGeometry(gameObject)
         || (options.IncludeLights && gameObject.TryGetComponent(out ILight? _))
         || options.ForceKeepPathIds.Contains(gameObject.PathID)
-        || socketKeep.Contains(gameObject.PathID);
+        || socketKeep.Contains(gameObject.PathID)
+        || boneKeep.Contains(gameObject.PathID);
+
+    /// <summary>Bones referenced by any skinned mesh keep their transforms:
+    /// they are the glTF joints, so they are exempt from pruning and from
+    /// empty-chain collapse (a folded bone would corrupt the skin).</summary>
+    private void BuildBoneKeep(IGameObject root)
+    {
+        foreach (var gameObject in root.FetchHierarchy().OfType<IGameObject>())
+        {
+            if (!gameObject.TryGetComponent(out ISkinnedMeshRenderer? skinned)
+                || skinned.MeshP is not IMesh mesh
+                || !mesh.IsSet())
+            {
+                continue;
+            }
+            foreach (var bone in skinned.BonesP.WhereNotNull())
+            {
+                if (bone.GameObject_C4P is { } boneGo)
+                {
+                    boneKeep.Add(boneGo.PathID);
+                }
+            }
+            if (skinned.RootBone.TryGetAsset(skinned.Collection) is ITransform rootBone
+                && rootBone.GameObject_C4P is { } rootBoneGo)
+            {
+                boneKeep.Add(rootBoneGo.PathID);
+            }
+        }
+    }
+
+    /// <summary>Bind stashed skinned meshes once the whole tree (and thus
+    /// every joint node) exists. The prefab is in bind pose, so inverse bind
+    /// matrices derive from the joints' current world transforms - no matrix
+    /// convention gymnastics, and exact for shipped prefabs. Falls back to a
+    /// rigid attach when a joint is unresolvable.</summary>
+    private void FinishSkins(SceneBuilder sceneBuilder)
+    {
+        foreach (var (meshBuilder, node, skinned, meshData) in pendingSkins)
+        {
+            var bonePtrs = skinned.BonesP.ToArray();
+            var joints = new NodeBuilder[bonePtrs.Length];
+            var resolved = true;
+            for (var i = 0; i < bonePtrs.Length; i++)
+            {
+                if (bonePtrs[i]?.GameObject_C4P is { } boneGo
+                    && nodeByGameObject.TryGetValue(boneGo.PathID, out var jointNode))
+                {
+                    joints[i] = jointNode;
+                }
+                else
+                {
+                    resolved = false;
+                    break;
+                }
+            }
+            var maxIndex = -1;
+            if (meshData.Skin is { } skin)
+            {
+                foreach (var w in skin)
+                {
+                    maxIndex = Math.Max(maxIndex, Math.Max(Math.Max(w.Index0, w.Index1), Math.Max(w.Index2, w.Index3)));
+                }
+            }
+            if (!resolved || joints.Length == 0 || maxIndex >= joints.Length)
+            {
+                sceneBuilder.AddRigidMesh(meshBuilder, node);
+                continue;
+            }
+            try
+            {
+                sceneBuilder.AddSkinnedMesh(meshBuilder, node.WorldMatrix, joints);
+            }
+            catch (ArgumentException)
+            {
+                // SharpGLTF rejects some joint sets (duplicate bone entries,
+                // joints outside the scene graph) - attach rigid, as before
+                sceneBuilder.AddRigidMesh(meshBuilder, node);
+            }
+        }
+    }
 
     /// <summary>Force-keep attachment transforms declared by serialized socket
     /// lists (ComponentSemantics.SocketLists) as named empties.</summary>
@@ -504,6 +589,7 @@ public class RipperGlbBuilder
             node.LocalMatrix = combined;
         }
         sceneBuilder.AddNode(node);
+        nodeByGameObject[gameObject.PathID] = node;
 
         // static / dynamic meshes via MeshFilter + (Mesh)Renderer
         if (gameObject.TryGetComponent(out IMeshFilter? meshFilter)
@@ -700,6 +786,14 @@ public class RipperGlbBuilder
                 ["unity_collection"] = mesh.Collection.Name,
             };
         }
-        sceneBuilder.AddRigidMesh(meshBuilder, node);
+        // skinned meshes bind after the walk, once every joint node exists
+        if (renderer is ISkinnedMeshRenderer skinnedRenderer && meshData.HasSkin)
+        {
+            pendingSkins.Add((meshBuilder, node, skinnedRenderer, meshData));
+        }
+        else
+        {
+            sceneBuilder.AddRigidMesh(meshBuilder, node);
+        }
     }
 }
