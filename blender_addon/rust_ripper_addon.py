@@ -15,6 +15,7 @@ import urllib.request
 import bpy
 from bpy.props import BoolProperty, FloatProperty, PointerProperty, StringProperty
 from bpy_extras.io_utils import ImportHelper
+from mathutils import Vector
 
 DAEMON = "http://127.0.0.1:17071"
 
@@ -749,6 +750,50 @@ def _arrange_nodes(tree):
             cursor = y - _NODE_HEIGHT.get(node.type, 160) - 40.0
 
 
+def _tidy_armatures(context, objects):
+    """Make imported skeletons read like rigs: glTF joints have no length, so
+    Blender draws stubs. Purely topological - each bone's tail goes to its
+    single child's head (average for forks, parent direction for leaves)."""
+    for arm_obj in [o for o in objects if o.type == "ARMATURE"]:
+        prev_active = context.view_layer.objects.active
+        try:
+            bpy.ops.object.select_all(action="DESELECT")
+        except RuntimeError:
+            pass
+        arm_obj.select_set(True)
+        context.view_layer.objects.active = arm_obj
+        try:
+            bpy.ops.object.mode_set(mode="EDIT")
+            bones = arm_obj.data.edit_bones
+            for bone in bones:
+                children = bone.children
+                if len(children) == 1:
+                    target = children[0].head
+                elif len(children) > 1:
+                    target = sum((c.head for c in children), Vector()) / len(children)
+                elif bone.parent is not None:
+                    direction = (bone.head - bone.parent.head)
+                    target = bone.head + (direction.normalized() * max(bone.parent.length * 0.5, 0.02)
+                                          if direction.length > 1e-6 else Vector((0, 0.05, 0)))
+                else:
+                    target = bone.head + Vector((0, 0.1, 0))
+                if (target - bone.head).length > 1e-4:
+                    bone.tail = target
+            for bone in bones:
+                if bone.parent is not None and (bone.head - bone.parent.tail).length < 1e-5:
+                    bone.use_connect = True
+            bpy.ops.object.mode_set(mode="OBJECT")
+        except Exception:
+            try:
+                bpy.ops.object.mode_set(mode="OBJECT")
+            except Exception:
+                pass
+        finally:
+            context.view_layer.objects.active = prev_active
+        arm_obj.data.display_type = "OCTAHEDRAL"
+        arm_obj.show_in_front = True
+
+
 def _import_glb(context, filepath):
     settings = context.scene.rust_ripper
     before_objects = set(bpy.data.objects)
@@ -757,6 +802,7 @@ def _import_glb(context, filepath):
     new_objects = [o for o in bpy.data.objects if o not in before_objects]
     new_materials = [m for m in bpy.data.materials if m not in before_materials]
     hidden, reused = _post_process(new_objects, settings)
+    _tidy_armatures(context, new_objects)
     painted = _build_paint_nodes(filepath, new_materials)
     painted += _build_blend_layer_nodes(filepath, new_materials, new_objects)
     painted += _build_blend4way_nodes(filepath, new_materials, new_objects)
