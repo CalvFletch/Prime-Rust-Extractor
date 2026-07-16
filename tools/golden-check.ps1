@@ -53,9 +53,9 @@ Assert "searchlight: flare material BLEND"   ($flare -and $flare.alphaMode -eq "
 
 # --- wolf: fur profile (fuzz alpha composite), KHR specular, demoted colors ---
 $g = Get-GlbJson (Export-Asset "wolf2")
-Assert "wolf: fuzz composite image"          (($g.images | Where-Object { $_.name -eq "Wolf_Albedo_fuzzalpha" }))
+Assert "wolf: no invented fuzz composite"    (-not ($g.images | Where-Object { $_.name -like "*_fuzzalpha" }))
 $fur = $g.materials | Where-Object { $_.name -eq "WolfFur" }
-Assert "wolf: fur material BLEND"            ($fur -and $fur.alphaMode -eq "BLEND")
+Assert "wolf: fur alpha-tested (MASK)"       ($fur -and $fur.alphaMode -eq "MASK" -and [math]::Abs($fur.alphaCutoff - 0.556) -lt 0.01)
 Assert "wolf: animal-fur profile applied"    ($fur -and $fur.extras.rust_profile -eq "animal-fur")
 Assert "wolf: KHR specular on body"          (($g.materials | Where-Object { $_.name -eq "Wolf" }).extensions.KHR_materials_specular)
 Assert "wolf: _RUST_COLOR demotion"          (($g.meshes.primitives.attributes | Where-Object { $_._RUST_COLOR -ne $null }))

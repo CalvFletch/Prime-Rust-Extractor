@@ -143,13 +143,12 @@ public class RipperMaterialFactory
 
         // --- base color: _MainTex * _Color ---
         // Unity serializes material colors as sRGB; glTF factors are linear.
-        // Fur shells (AnimalFur) keep their density mask in _FuzzMask: composite
-        // it into the diffuse alpha and blend, or the shell renders as an
-        // opaque second skin over the body.
+        // Fur (AnimalFur): the albedo's own alpha is the tuft transparency,
+        // alpha-tested by the compiled program (profile.UsesAlphaTest);
+        // _FuzzMask only shades the fuzz colour term.
         // The detail layer is Rust's paint system (barrels: _DetailMask marks
         // the painted band, _DetailColor is the paint) - baked into the albedo.
         var baseColor = SrgbToLinearFactor(colors.TryGetValue("_Color", out var c) ? c : new System.Numerics.Vector4(1, 1, 1, 1));
-        var fuzzTexture = profile.FuzzMaskSlot is { } fuzzSlot ? GetTexture(material, fuzzSlot) : null;
         var diffuseTexture = GetTexture(material, profile.BaseColorSlots);
         var detailMask = profile.SupportsDetailPaint ? GetTexture(material, "_DetailMask") : null;
         var detailAlbedo = profile.SupportsDetailPaint ? GetTexture(material, "_DetailAlbedoMap") : null;
@@ -194,23 +193,6 @@ public class RipperMaterialFactory
             }
         }
         var baseColorSet = false;
-        if (fuzzTexture is not null && diffuseTexture is not null)
-        {
-            var key = (diffuseTexture, "difffuzz");
-            if (!imageCache.TryGetValue(key, out var furImage))
-            {
-                furImage = DecodeDiffuseWithFuzzAlpha(diffuseTexture, fuzzTexture);
-                imageCache.Add(key, furImage);
-            }
-            if (furImage is not null)
-            {
-                builder.WithBaseColor(furImage.Value, baseColor);
-                // distinct name: this is diffuse RGB + fuzz-mask alpha, not the body albedo
-                NameChannelImage(builder, KnownChannel.BaseColor, diffuseTexture.Name.String + "_fuzzalpha");
-                builder.WithAlpha(AlphaMode.BLEND);
-                baseColorSet = true;
-            }
-        }
         if (!baseColorSet && detailTintActive && diffuseTexture is not null)
         {
             colors.TryGetValue("_DetailColor", out var dc);
@@ -380,6 +362,14 @@ public class RipperMaterialFactory
                     alphaSet = true;
                     break;
             }
+        }
+        // alpha-tested shaders without _Mode (AnimalFur: the compiled program
+        // discards below _Cutoff; alpha = albedo.a lerped toward linearized
+        // vertex red by _AlphaLerp, plus _AlphaNudge - see OUTPUT_CONTRACT)
+        if (!alphaSet && profile.UsesAlphaTest)
+        {
+            builder.WithAlpha(AlphaMode.MASK, floats.TryGetValue("_Cutoff", out var testCutoff) ? testCutoff : 0.5f);
+            alphaSet = true;
         }
         // shaders without _Mode (particles, custom): the render state itself
         // says transparent - depth write off + over blending (rotor blur planes)
@@ -682,41 +672,6 @@ public class RipperMaterialFactory
                     (byte)(MathF.Pow(g, 1f / 2.2f) * 255f),
                     (byte)(MathF.Pow(b, 1f / 2.2f) * 255f),
                     p.A);
-            }
-        }
-        using var outStream = new MemoryStream();
-        diffuse.SaveAsPng(outStream);
-        return new MemoryImage(outStream.ToArray());
-    }
-
-    /// <summary>Diffuse RGB with the fuzz mask's red channel as alpha (fur shell density).</summary>
-    private static MemoryImage? DecodeDiffuseWithFuzzAlpha(ITexture2D diffuseTexture, ITexture2D fuzzTexture)
-    {
-        if (!TextureConverter.TryConvertToBitmap(diffuseTexture, out DirectBitmap diffuseBitmap)
-            || !TextureConverter.TryConvertToBitmap(fuzzTexture, out DirectBitmap fuzzBitmap))
-        {
-            return null;
-        }
-        using var diffuseStream = new MemoryStream();
-        diffuseBitmap.SaveAsPng(diffuseStream);
-        diffuseStream.Position = 0;
-        using var fuzzStream = new MemoryStream();
-        fuzzBitmap.SaveAsPng(fuzzStream);
-        fuzzStream.Position = 0;
-
-        using var diffuse = Image.Load<Rgba32>(diffuseStream);
-        using var fuzz = Image.Load<Rgba32>(fuzzStream);
-        if (fuzz.Width != diffuse.Width || fuzz.Height != diffuse.Height)
-        {
-            fuzz.Mutate(x => x.Resize(diffuse.Width, diffuse.Height));
-        }
-        for (var y = 0; y < diffuse.Height; y++)
-        {
-            for (var x = 0; x < diffuse.Width; x++)
-            {
-                var p = diffuse[x, y];
-                p.A = fuzz[x, y].R;
-                diffuse[x, y] = p;
             }
         }
         using var outStream = new MemoryStream();

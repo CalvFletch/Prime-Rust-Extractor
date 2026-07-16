@@ -28,8 +28,9 @@ public sealed record ShaderProfile
     public string[] OcclusionSlots { get; init; } = [];
     public string[] EmissiveSlots { get; init; } = [];
 
-    /// <summary>Mask whose red channel becomes base-color alpha (fur shells).</summary>
-    public string? FuzzMaskSlot { get; init; }
+    /// <summary>The compiled programs alpha-test (discard below _Cutoff)
+    /// without declaring Unity's _Mode float.</summary>
+    public bool UsesAlphaTest { get; init; }
 
     /// <summary>Shader implements the detail-layer paint system (_DetailLayer/_DetailMask/_DetailColor).</summary>
     public bool SupportsDetailPaint { get; init; }
@@ -91,6 +92,10 @@ public static class ShaderProfiles
         SupportsAlbedoAlphaSmoothness = true,
     };
 
+    /// <summary>Fur shells. Read from the compiled programs: the albedo's OWN
+    /// alpha carries the tuft transparency (alpha-tested at _Cutoff after a
+    /// lerp toward linearized vertex red); _FuzzMask only shades the fuzz
+    /// COLOUR term and rides in extras.</summary>
     public static readonly ShaderProfile AnimalFur = new()
     {
         Id = "animal-fur",
@@ -98,7 +103,7 @@ public static class ShaderProfiles
         BaseColorSlots = ["_Diffuse"],
         SpecGlossSlots = ["_Specular"],
         OcclusionSlots = ["_AO"],
-        FuzzMaskSlot = "_FuzzMask",
+        UsesAlphaTest = true,
     };
 
     /// <summary>Rust's foliage system. Slot mapping is provisional — the snow
