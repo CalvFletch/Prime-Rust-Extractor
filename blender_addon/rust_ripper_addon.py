@@ -584,60 +584,20 @@ def _build_blend4way_nodes(glb_path, materials, objects):
     return built
 
 
-def _build_fur_alpha_nodes(glb_path, materials, objects):
-    """Alpha-tested fur (AnimalFur), exact formula from the compiled shader
-    (docs/OUTPUT_CONTRACT.md):
-
-        alpha = lerp(albedo.a, linear(vertexColor.r), _AlphaLerp) + _AlphaNudge
-        discard when alpha < _Cutoff
-
-    Without the vertex-colour lerp the dark tuft roots survive the cutoff
-    and the undercoat reads black. Gated on the mechanism's own parameters.
-    """
-    built = 0
+def _count_fur_materials(materials):
+    """Alpha-tested fur (AnimalFur): the glTF MASK import (raw albedo alpha,
+    alphaCutoff = _Cutoff) is the right graph as-is - the full shader formula
+    additionally lerps toward vertex red (docs/OUTPUT_CONTRACT.md) but the
+    plain clip reads correctly. Detected by the mechanism's own parameters,
+    only to raise the Cycles transparent bounce budget for the shell stack."""
+    count = 0
     for mat in materials:
         if not mat or not mat.use_nodes:
             continue
         floats = mat.get("unity_floats")
-        if floats is None or not all(k in floats.keys() for k in ("_AlphaLerp", "_AlphaNudge", "_Cutoff")):
-            continue
-        tree = mat.node_tree
-        bsdf = next((n for n in tree.nodes if n.type == "BSDF_PRINCIPLED"), None)
-        if bsdf is None or not bsdf.inputs["Alpha"].is_linked:
-            continue
-        alpha_src = bsdf.inputs["Alpha"].links[0].from_socket
-        if "_RUST_COLOR" not in _material_color_attributes(mat, objects):
-            continue
-        nodes, links = tree.nodes, tree.links
-
-        vcol = nodes.new("ShaderNodeVertexColor")
-        vcol.layer_name = "_RUST_COLOR"
-        vcol.label = "vertex colour (fur alpha)"
-        sep = nodes.new("ShaderNodeSeparateColor")
-        sep.label = "vertex red"
-        links.new(vcol.outputs["Color"], sep.inputs["Color"])
-
-        mix = nodes.new("ShaderNodeMix")
-        mix.data_type = "FLOAT"
-        mix.label = "lerp(albedo.a, vcol.r, _AlphaLerp)"
-        mix.inputs[0].default_value = floats["_AlphaLerp"]
-        links.new(alpha_src, mix.inputs[2])
-        links.new(sep.outputs["Red"], mix.inputs[3])
-
-        nudge = nodes.new("ShaderNodeMath")
-        nudge.operation = "ADD"
-        nudge.label = "+ _AlphaNudge"
-        nudge.inputs[1].default_value = floats["_AlphaNudge"]
-        links.new(mix.outputs[0], nudge.inputs[0])
-
-        cut = nodes.new("ShaderNodeMath")
-        cut.operation = "GREATER_THAN"
-        cut.label = "discard < _Cutoff"
-        cut.inputs[1].default_value = floats["_Cutoff"]
-        links.new(nudge.outputs[0], cut.inputs[0])
-        links.new(cut.outputs[0], bsdf.inputs["Alpha"])
-        built += 1
-    return built
+        if floats is not None and all(k in floats.keys() for k in ("_AlphaLerp", "_AlphaNudge", "_Cutoff")):
+            count += 1
+    return count
 
 
 # ------------------------------------------------------------- node layout
@@ -721,9 +681,7 @@ def _import_glb(context, filepath):
     painted = _build_paint_nodes(filepath, new_materials)
     painted += _build_blend_layer_nodes(filepath, new_materials, new_objects)
     painted += _build_blend4way_nodes(filepath, new_materials, new_objects)
-    fur = _build_fur_alpha_nodes(filepath, new_materials, new_objects)
-    painted += fur
-    if fur and context.scene.render.engine == "CYCLES":
+    if _count_fur_materials(new_materials) and context.scene.render.engine == "CYCLES":
         # fur shells stack many alpha layers; rays that exhaust Cycles'
         # transparent bounce budget terminate BLACK between the tufts
         cycles = context.scene.cycles
