@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Rust Ripper",
     "author": "Rust Ripper",
-    "version": (0, 2, 0),
+    "version": (0, 2, 1),
     "blender": (4, 2, 0),
     "location": "3D Viewport > Sidebar > Rust  |  File > Import",
     "description": "Import Rust Ripper GLB exports: PBR materials, blend layers, light tools, bridge connection",
@@ -191,7 +191,7 @@ def _wire_uv(tree, tex_node, mat, objects, uv_index, entry, label):
 
 
 _BLEND_LAYER_GROUP = "Rust/Standard Blend Layer"
-_GROUP_VERSION = 3
+_GROUP_VERSION = 4
 
 
 def _blend_layer_group():
@@ -239,9 +239,12 @@ def _blend_layer_group():
     socket("Base Roughness", "INPUT", "NodeSocketFloat", 1.0)
     socket("Layer Metallic", "INPUT", "NodeSocketFloat", 0.0)
     socket("Layer Roughness", "INPUT", "NodeSocketFloat", 1.0)
+    socket("Base Normal", "INPUT", "NodeSocketVector", (0.0, 0.0, 1.0))
+    socket("Layer Normal", "INPUT", "NodeSocketVector", (0.0, 0.0, 1.0))
     socket("Color", "OUTPUT", "NodeSocketColor")
     socket("Metallic", "OUTPUT", "NodeSocketFloat")
     socket("Roughness", "OUTPUT", "NodeSocketFloat")
+    socket("Normal", "OUTPUT", "NodeSocketVector")
     socket("Blend Factor", "OUTPUT", "NodeSocketFloat")
 
     nodes, links = group.nodes, group.links
@@ -320,9 +323,22 @@ def _blend_layer_group():
     metal_mix = float_lerp("metallic by blend", "Base Metallic", "Layer Metallic")
     rough_mix = float_lerp("roughness by blend", "Base Roughness", "Layer Roughness")
 
+    # the compiled programs lerp unpacked normals by the same blend factor
+    normal_mix = nodes.new("ShaderNodeMix")
+    normal_mix.data_type = "VECTOR"
+    normal_mix.label = "normal by blend"
+    links.new(clamped.outputs[0], normal_mix.inputs[0])
+    links.new(group_in.outputs["Base Normal"], normal_mix.inputs[4])
+    links.new(group_in.outputs["Layer Normal"], normal_mix.inputs[5])
+    normal_norm = nodes.new("ShaderNodeVectorMath")
+    normal_norm.operation = "NORMALIZE"
+    normal_norm.label = "renormalize"
+    links.new(normal_mix.outputs[1], normal_norm.inputs[0])
+
     links.new(blend.outputs[2], group_out.inputs["Color"])
     links.new(metal_mix.outputs[0], group_out.inputs["Metallic"])
     links.new(rough_mix.outputs[0], group_out.inputs["Roughness"])
+    links.new(normal_norm.outputs[0], group_out.inputs["Normal"])
     links.new(clamped.outputs[0], group_out.inputs["Blend Factor"])
     _arrange_nodes(group)
     return group
@@ -378,6 +394,52 @@ def _route_metal_rough_through(tree, bsdf, layer_node):
         else:
             layer_node.inputs[base_socket].default_value = bsdf_input.default_value
         links.new(layer_node.outputs[out_socket], bsdf_input)
+
+
+def _wire_layer_normal(tree, mat, objects, layer_node, glb_path, floats,
+                       nrm_slot, scale_float, uv_index, label):
+    """Feed a layer group's normal input from the layer's own normal map -
+    the compiled programs unpack (x NormalMapScale), then lerp normals by
+    the same factor as albedo. Mixing Normal Map node outputs (world space)
+    and renormalizing is that same operation."""
+    entry = _texture_entry(mat, nrm_slot)
+    path = entry and _sidecar_path(glb_path, entry["name"])
+    if not path:
+        return
+    nodes, links = tree.nodes, tree.links
+    img = bpy.data.images.load(path, check_existing=True)
+    img.colorspace_settings.name = "sRGB" if entry.get("srgb", False) else "Non-Color"
+    tex = nodes.new("ShaderNodeTexImage")
+    tex.image = img
+    tex.label = f"{label} normal"
+    _wire_uv(tree, tex, mat, objects, uv_index, entry, f"{label} nrm")
+    nmap = nodes.new("ShaderNodeNormalMap")
+    nmap.label = f"{label} tangent normal"
+    nmap.inputs["Strength"].default_value = floats.get(scale_float, 1.0) if scale_float else 1.0
+    uv_name = _uv_map_name(mat, objects, uv_index)
+    if uv_name:
+        nmap.uv_map = uv_name
+    links.new(tex.outputs["Color"], nmap.inputs["Color"])
+    links.new(nmap.outputs["Normal"], layer_node.inputs["Layer Normal"])
+
+
+def _route_normal_through(tree, bsdf, layer_node):
+    """Chain the BSDF normal through a layer group when the layer brings its
+    own normal map; without a base normal map the geometry normal stands in
+    (a constant vector default would be wrong in world space)."""
+    if not layer_node.inputs["Layer Normal"].is_linked:
+        return
+    links = tree.links
+    normal_input = bsdf.inputs["Normal"]
+    if normal_input.is_linked:
+        links.new(normal_input.links[0].from_socket, layer_node.inputs["Base Normal"])
+    else:
+        geometry = next((n for n in tree.nodes if n.type == "NEW_GEOMETRY"), None)
+        if geometry is None:
+            geometry = tree.nodes.new("ShaderNodeNewGeometry")
+            geometry.label = "geometry normal"
+        links.new(geometry.outputs["Normal"], layer_node.inputs["Base Normal"])
+    links.new(layer_node.outputs["Normal"], normal_input)
 
 
 def _build_blend_layer_nodes(glb_path, materials, objects):
@@ -478,6 +540,10 @@ def _build_blend_layer_nodes(glb_path, materials, objects):
                                 "_DetailMetallicGlossMap", None, "_DetailMetallic", "_DetailGlossiness",
                                 int(floats.get("_UVSec", 0.0)), "_Detail")
         _route_metal_rough_through(tree, bsdf, layer)
+        _wire_layer_normal(tree, mat, objects, layer, glb_path, floats,
+                           "_DetailNormalMap", "_DetailNormalMapScale",
+                           int(floats.get("_UVSec", 0.0)), "_Detail")
+        _route_normal_through(tree, bsdf, layer)
         built += 1
     return built
 
@@ -496,11 +562,11 @@ def _blend4way_group():
         out   = lerp(base, layer, blend)
     """
     group = bpy.data.node_groups.get(_BLEND4WAY_GROUP)
-    if group is not None and group.get("rust_ripper_version", 0) >= 2:
+    if group is not None and group.get("rust_ripper_version", 0) >= 3:
         return group
     if group is None:
         group = bpy.data.node_groups.new(_BLEND4WAY_GROUP, "ShaderNodeTree")
-    group["rust_ripper_version"] = 2
+    group["rust_ripper_version"] = 3
     group.use_fake_user = True
 
     present = {(item.name, item.in_out) for item in group.interface.items_tree
@@ -527,9 +593,12 @@ def _blend4way_group():
     socket("Base Roughness", "INPUT", "NodeSocketFloat", 1.0)
     socket("Layer Metallic", "INPUT", "NodeSocketFloat", 0.0)
     socket("Layer Roughness", "INPUT", "NodeSocketFloat", 1.0)
+    socket("Base Normal", "INPUT", "NodeSocketVector", (0.0, 0.0, 1.0))
+    socket("Layer Normal", "INPUT", "NodeSocketVector", (0.0, 0.0, 1.0))
     socket("Color", "OUTPUT", "NodeSocketColor")
     socket("Metallic", "OUTPUT", "NodeSocketFloat")
     socket("Roughness", "OUTPUT", "NodeSocketFloat")
+    socket("Normal", "OUTPUT", "NodeSocketVector")
     socket("Blend Factor", "OUTPUT", "NodeSocketFloat")
 
     nodes, links = group.nodes, group.links
@@ -614,9 +683,22 @@ def _blend4way_group():
     metal_mix = float_lerp("metallic by blend", "Base Metallic", "Layer Metallic")
     rough_mix = float_lerp("roughness by blend", "Base Roughness", "Layer Roughness")
 
+    # the compiled programs lerp unpacked normals by the same blend factor
+    normal_mix = nodes.new("ShaderNodeMix")
+    normal_mix.data_type = "VECTOR"
+    normal_mix.label = "normal by blend"
+    links.new(clamped.outputs[0], normal_mix.inputs[0])
+    links.new(group_in.outputs["Base Normal"], normal_mix.inputs[4])
+    links.new(group_in.outputs["Layer Normal"], normal_mix.inputs[5])
+    normal_norm = nodes.new("ShaderNodeVectorMath")
+    normal_norm.operation = "NORMALIZE"
+    normal_norm.label = "renormalize"
+    links.new(normal_mix.outputs[1], normal_norm.inputs[0])
+
     links.new(blend.outputs[2], group_out.inputs["Color"])
     links.new(metal_mix.outputs[0], group_out.inputs["Metallic"])
     links.new(rough_mix.outputs[0], group_out.inputs["Roughness"])
+    links.new(normal_norm.outputs[0], group_out.inputs["Normal"])
     links.new(clamped.outputs[0], group_out.inputs["Blend Factor"])
     _arrange_nodes(group)
     return group
@@ -710,6 +792,10 @@ def _build_blend4way_nodes(glb_path, materials, objects):
                                     f"_BlendLayer{n}_Metallic", f"_BlendLayer{n}_Glossiness",
                                     int(floats.get(f"_BlendLayer{n}_UVSet", 0.0)), f"_BlendLayer{n}")
             _route_metal_rough_through(tree, bsdf, layer)
+            _wire_layer_normal(tree, mat, objects, layer, glb_path, floats,
+                               f"_BlendLayer{n}_NormalMap", f"_BlendLayer{n}_NormalMapScale",
+                               int(floats.get(f"_BlendLayer{n}_UVSet", 0.0)), f"_BlendLayer{n}")
+            _route_normal_through(tree, bsdf, layer)
         links.new(chain_socket, base_input)
         built += 1
     return built
