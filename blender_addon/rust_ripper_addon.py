@@ -1,17 +1,15 @@
 bl_info = {
     "name": "Rust Ripper",
     "author": "Rust Ripper",
-    "version": (0, 1, 5),
+    "version": (0, 2, 0),
     "blender": (4, 2, 0),
-    "location": "3D Viewport > Sidebar > Rust",
-    "description": "Import Rust Ripper GLB exports: correct visibility, paint controls, light tools, daemon search",
+    "location": "3D Viewport > Sidebar > Rust  |  File > Import",
+    "description": "Import Rust Ripper GLB exports: PBR materials, blend layers, light tools, bridge connection",
     "category": "Import-Export",
 }
 
 import json
 import os
-import tempfile
-import urllib.parse
 import urllib.request
 
 import bpy
@@ -24,7 +22,6 @@ DAEMON = "http://127.0.0.1:17071"
 # ---------------------------------------------------------------- settings
 
 class RustRipperSettings(bpy.types.PropertyGroup):
-    query: StringProperty(name="Search", description="Asset to fetch from the Rust Ripper daemon", default="")
     root_display_size: FloatProperty(
         name="Root Size", description="Display size of imported root empties",
         default=10.0, min=0.1, max=100.0)
@@ -40,10 +37,6 @@ class RustRipperSettings(bpy.types.PropertyGroup):
         name="Light Power",
         description="Scale factor applied to imported light energy",
         default=1.0, min=0.0, max=100.0)
-    tidy_nodes: BoolProperty(
-        name="Tidy node layouts",
-        description="Auto-arrange material nodes left-to-right after import (no stacked nodes)",
-        default=True)
 
 
 # ---------------------------------------------------------------- core
@@ -591,6 +584,62 @@ def _build_blend4way_nodes(glb_path, materials, objects):
     return built
 
 
+def _build_fur_alpha_nodes(glb_path, materials, objects):
+    """Alpha-tested fur (AnimalFur), exact formula from the compiled shader
+    (docs/OUTPUT_CONTRACT.md):
+
+        alpha = lerp(albedo.a, linear(vertexColor.r), _AlphaLerp) + _AlphaNudge
+        discard when alpha < _Cutoff
+
+    Without the vertex-colour lerp the dark tuft roots survive the cutoff
+    and the undercoat reads black. Gated on the mechanism's own parameters.
+    """
+    built = 0
+    for mat in materials:
+        if not mat or not mat.use_nodes:
+            continue
+        floats = mat.get("unity_floats")
+        if floats is None or not all(k in floats.keys() for k in ("_AlphaLerp", "_AlphaNudge", "_Cutoff")):
+            continue
+        tree = mat.node_tree
+        bsdf = next((n for n in tree.nodes if n.type == "BSDF_PRINCIPLED"), None)
+        if bsdf is None or not bsdf.inputs["Alpha"].is_linked:
+            continue
+        alpha_src = bsdf.inputs["Alpha"].links[0].from_socket
+        if "_RUST_COLOR" not in _material_color_attributes(mat, objects):
+            continue
+        nodes, links = tree.nodes, tree.links
+
+        vcol = nodes.new("ShaderNodeVertexColor")
+        vcol.layer_name = "_RUST_COLOR"
+        vcol.label = "vertex colour (fur alpha)"
+        sep = nodes.new("ShaderNodeSeparateColor")
+        sep.label = "vertex red"
+        links.new(vcol.outputs["Color"], sep.inputs["Color"])
+
+        mix = nodes.new("ShaderNodeMix")
+        mix.data_type = "FLOAT"
+        mix.label = "lerp(albedo.a, vcol.r, _AlphaLerp)"
+        mix.inputs[0].default_value = floats["_AlphaLerp"]
+        links.new(alpha_src, mix.inputs[2])
+        links.new(sep.outputs["Red"], mix.inputs[3])
+
+        nudge = nodes.new("ShaderNodeMath")
+        nudge.operation = "ADD"
+        nudge.label = "+ _AlphaNudge"
+        nudge.inputs[1].default_value = floats["_AlphaNudge"]
+        links.new(mix.outputs[0], nudge.inputs[0])
+
+        cut = nodes.new("ShaderNodeMath")
+        cut.operation = "GREATER_THAN"
+        cut.label = "discard < _Cutoff"
+        cut.inputs[1].default_value = floats["_Cutoff"]
+        links.new(nudge.outputs[0], cut.inputs[0])
+        links.new(cut.outputs[0], bsdf.inputs["Alpha"])
+        built += 1
+    return built
+
+
 # ------------------------------------------------------------- node layout
 
 _NODE_HEIGHT = {
@@ -672,10 +721,14 @@ def _import_glb(context, filepath):
     painted = _build_paint_nodes(filepath, new_materials)
     painted += _build_blend_layer_nodes(filepath, new_materials, new_objects)
     painted += _build_blend4way_nodes(filepath, new_materials, new_objects)
-    if settings.tidy_nodes:
-        for mat in new_materials:
-            if mat.use_nodes:
-                _arrange_nodes(mat.node_tree)
+    painted += _build_fur_alpha_nodes(filepath, new_materials, new_objects)
+    # NOTE: nodes should always be created neatly. The current _arrange_nodes is
+    # a basic left-to-right layout. Research better programmatic shader layout
+    # methods (e.g. graphviz-style Sugiyama, or Blender's node.dimensions-based
+    # grid packing) for more readable auto-generated materials.
+    for mat in new_materials:
+        if mat.use_nodes:
+            _arrange_nodes(mat.node_tree)
     return len(new_objects), hidden, painted, reused
 
 
@@ -701,8 +754,8 @@ def _is_fill_light(obj):
 
 class RUST_OT_import_glb(bpy.types.Operator, ImportHelper):
     bl_idname = "rust.import_glb"
-    bl_label = "Import Rust GLB"
-    bl_description = "Import a Rust Ripper GLB with visibility, paint and light handling"
+    bl_label = "Rust Ripper GLB (.glb)"
+    bl_description = "Import a Rust Ripper GLB with PBR materials, blend layers, visibility and light handling"
     bl_options = {"REGISTER", "UNDO"}
     filename_ext = ".glb"
     filter_glob: StringProperty(default="*.glb", options={"HIDDEN"})
@@ -713,38 +766,34 @@ class RUST_OT_import_glb(bpy.types.Operator, ImportHelper):
         return {"FINISHED"}
 
 
-class RUST_OT_daemon_import(bpy.types.Operator):
-    bl_idname = "rust.daemon_import"
-    bl_label = "Fetch from Game"
-    bl_description = "Export the searched asset via the Rust Ripper daemon and import it (first fetch of an asset may load bundles for a couple of minutes)"
-    bl_options = {"REGISTER", "UNDO"}
+class RUST_OT_check_connection(bpy.types.Operator):
+    bl_idname = "rust.check_connection"
+    bl_label = "Check Bridge"
+    bl_description = "Test if the Rust Ripper bridge daemon is reachable"
 
     def execute(self, context):
-        query = context.scene.rust_ripper.query.strip()
-        if not query:
-            self.report({"ERROR"}, "Type an asset name first")
-            return {"CANCELLED"}
-        out_dir = os.path.join(tempfile.gettempdir(), "rust_ripper")
-        os.makedirs(out_dir, exist_ok=True)
-        url = f"{DAEMON}/export?q={urllib.parse.quote(query)}&out={urllib.parse.quote(out_dir)}"
         try:
-            with urllib.request.urlopen(url, timeout=600) as response:
-                result = json.loads(response.read())
-        except Exception as error:
-            self.report({"ERROR"}, f"daemon not reachable ({error}) - run: ripper serve")
-            return {"CANCELLED"}
-        if not result.get("success"):
-            self.report({"ERROR"}, result.get("message", "export failed"))
-            return {"CANCELLED"}
-        count, hidden, painted, reused = _import_glb(context, result["path"])
-        self.report({"INFO"}, f"{query}: {count} objects in {result.get('seconds', 0):.1f}s export ({reused} meshes reused)")
+            with urllib.request.urlopen(f"{DAEMON}/status", timeout=5) as response:
+                data = json.loads(response.read())
+            context.scene.rust_ripper["bridge_connected"] = True
+            self.report({"INFO"}, f"Bridge active — Rust Ripper {data.get('version', '?')}")
+        except Exception as e:
+            context.scene.rust_ripper["bridge_connected"] = False
+            self.report({"WARNING"}, f"Bridge not reachable ({e})")
         return {"FINISHED"}
 
 
 class RUST_OT_hide_fill_lights(bpy.types.Operator):
     bl_idname = "rust.hide_fill_lights"
     bl_label = "Hide Fill Lights"
-    bl_description = "Hide bounce/fill lights (vertex render mode, or shadowless cookie-less faint lights) - heuristic, review the list"
+    bl_description = (
+        "Hide bounce/fill lights (vertex render mode, or shadowless cookie-less faint lights).\n"
+        "Light types in Rust:\n"
+        "  • Key lights — cast shadows, main scene lighting\n"
+        "  • Fill lights — no shadows, low intensity, ambient bounce fakes\n"
+        "  • Cookie lights — projected texture (stained glass, caustics)\n"
+        "This operator hides fill lights only."
+    )
 
     def execute(self, context):
         count = 0
@@ -760,6 +809,7 @@ class RUST_OT_hide_fill_lights(bpy.types.Operator):
 class RUST_OT_show_all_lights(bpy.types.Operator):
     bl_idname = "rust.show_all_lights"
     bl_label = "Show All Lights"
+    bl_description = "Unhide all lights in the scene"
 
     def execute(self, context):
         for obj in context.scene.objects:
@@ -780,19 +830,20 @@ class RUST_PT_main(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         settings = context.scene.rust_ripper
-        row = layout.row(align=True)
-        row.prop(settings, "query", text="")
-        row.operator("rust.daemon_import", text="", icon="IMPORT")
         layout.operator("rust.import_glb", icon="FILE_3D")
+        layout.separator()
         layout.prop(settings, "root_display_size")
         layout.prop(settings, "auto_hide")
         layout.prop(settings, "reuse_meshes")
         layout.prop(settings, "light_power_scale")
-        layout.prop(settings, "tidy_nodes")
+        layout.separator()
+        row = layout.row(align=True)
+        row.operator("rust.hide_fill_lights", icon="LIGHT_SUN")
+        row.operator("rust.show_all_lights", icon="HIDE_OFF")
 
 
-class RUST_PT_lights(bpy.types.Panel):
-    bl_label = "Lights"
+class RUST_PT_bridge(bpy.types.Panel):
+    bl_label = "Bridge"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = "Rust"
@@ -800,39 +851,34 @@ class RUST_PT_lights(bpy.types.Panel):
 
     def draw(self, context):
         layout = self.layout
+        settings = context.scene.rust_ripper
+        connected = settings.get("bridge_connected", False)
         row = layout.row(align=True)
-        row.operator("rust.hide_fill_lights", icon="LIGHT_SUN")
-        row.operator("rust.show_all_lights", icon="HIDE_OFF")
-        lights = [o for o in context.scene.objects if o.type == "LIGHT" and _light_info(o)]
-        if not lights:
-            layout.label(text="No Rust lights in scene")
-            return
-        col = layout.column(align=True)
-        for obj in sorted(lights, key=lambda o: o.name):
-            info = _light_info(obj) or {}
-            row = col.row(align=True)
-            row.prop(obj, "hide_viewport", text="", emboss=False,
-                     icon="HIDE_ON" if obj.hide_viewport or obj.hide_get() else "HIDE_OFF")
-            badges = []
-            if info.get("unity_shadows"):
-                badges.append("S")
-            if info.get("unity_cookie"):
-                badges.append("C")
-            if info.get("unity_render_mode") == 2:
-                badges.append("fill")
-            label = obj.name if not badges else f"{obj.name}  [{'/'.join(badges)}]"
-            row.label(text=label, icon=f"LIGHT_{obj.data.type}" if obj.data.type in ("POINT", "SPOT", "SUN", "AREA") else "LIGHT")
-            row.label(text=f"{info.get('unity_intensity', 0):.0f}")
+        row.operator("rust.check_connection", icon="URL")
+        if connected:
+            row.label(text="", icon="CHECKBOX_HLT")
+        else:
+            row.label(text="", icon="CHECKBOX_DEHLT")
+        layout.label(
+            text="Connected" if connected else "Not connected",
+            icon="DECORATE_LINKED" if connected else "DECORATE_BROKEN",
+        )
+
+
+# ---------------------------------------------------------------- menu hook
+
+def _menu_import(self, context):
+    self.layout.operator("rust.import_glb", text="Rust Ripper GLB (.glb)")
 
 
 classes = (
     RustRipperSettings,
     RUST_OT_import_glb,
-    RUST_OT_daemon_import,
+    RUST_OT_check_connection,
     RUST_OT_hide_fill_lights,
     RUST_OT_show_all_lights,
     RUST_PT_main,
-    RUST_PT_lights,
+    RUST_PT_bridge,
 )
 
 
@@ -840,9 +886,11 @@ def register():
     for cls in classes:
         bpy.utils.register_class(cls)
     bpy.types.Scene.rust_ripper = PointerProperty(type=RustRipperSettings)
+    bpy.types.TOPBAR_MT_file_import.append(_menu_import)
 
 
 def unregister():
+    bpy.types.TOPBAR_MT_file_import.remove(_menu_import)
     del bpy.types.Scene.rust_ripper
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)

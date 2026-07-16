@@ -28,8 +28,9 @@ public sealed record ShaderProfile
     public string[] OcclusionSlots { get; init; } = [];
     public string[] EmissiveSlots { get; init; } = [];
 
-    /// <summary>The compiled programs alpha-test (discard below _Cutoff)
-    /// without declaring Unity's _Mode float.</summary>
+    /// <summary>Every shipped fragment variant alpha-tests (discard below
+    /// _Cutoff) without declaring Unity's _Mode float. AnimalFur ships only
+    /// _OPACITYMASK_ON variants - materials do not opt in via keywords.</summary>
     public bool UsesAlphaTest { get; init; }
 
     /// <summary>Shader implements the detail-layer paint system (_DetailLayer/_DetailMask/_DetailColor).</summary>

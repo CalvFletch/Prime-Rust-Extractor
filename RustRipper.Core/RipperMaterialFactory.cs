@@ -363,9 +363,10 @@ public class RipperMaterialFactory
                     break;
             }
         }
-        // alpha-tested shaders without _Mode (AnimalFur: the compiled program
-        // discards below _Cutoff; alpha = albedo.a lerped toward linearized
-        // vertex red by _AlphaLerp, plus _AlphaNudge - see OUTPUT_CONTRACT)
+        // alpha-tested shaders without _Mode (AnimalFur ships only
+        // _OPACITYMASK_ON variants: discard below _Cutoff; alpha = albedo.a
+        // lerped toward linearized vertex red by _AlphaLerp, plus _AlphaNudge
+        // - see OUTPUT_CONTRACT; the addon builds the full formula)
         if (!alphaSet && profile.UsesAlphaTest)
         {
             builder.WithAlpha(AlphaMode.MASK, floats.TryGetValue("_Cutoff", out var testCutoff) ? testCutoff : 0.5f);
@@ -806,6 +807,36 @@ public class RipperMaterialFactory
     }
 
     /// <summary>Read a single float property off a material (e.g. _ApplyVertexColor).</summary>
+    /// <summary>The material's enabled shader keywords (m_ValidKeywords, or
+    /// the space-separated m_ShaderKeywords string on older data).</summary>
+    public static IReadOnlyList<string> GetShaderKeywords(IMaterial material)
+    {
+        var result = new List<string>();
+        try
+        {
+            foreach (var keyword in material.ValidKeywords_C21)
+            {
+                result.Add(keyword.String);
+            }
+        }
+        catch
+        {
+            // field absent before 2021.2
+        }
+        if (result.Count == 0)
+        {
+            try
+            {
+                result.AddRange(material.ShaderKeywords_C21_Utf8String.String
+                    .Split(' ', StringSplitOptions.RemoveEmptyEntries));
+            }
+            catch
+            {
+            }
+        }
+        return result;
+    }
+
     public static bool TryGetFloat(IMaterial material, string name, out float value)
     {
         value = 0f;

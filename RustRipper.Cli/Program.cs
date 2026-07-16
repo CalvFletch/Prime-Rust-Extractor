@@ -1410,6 +1410,11 @@ internal sealed class Session
         var shaderName = material.Shader_C21P?.Name ?? "(shader not loaded)";
         sb.AppendLine($"\nmaterial: {material.Name}");
         sb.AppendLine($"  method (shader): {shaderName}");
+        var keywords = RustRipper.Core.RipperMaterialFactory.GetShaderKeywords(material);
+        if (keywords.Count > 0)
+        {
+            sb.AppendLine($"  keywords: {string.Join(' ', keywords)}");
+        }
         foreach (var (name, texEnv) in material.GetTextureProperties())
         {
             string texDescription;
