@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Rust Ripper",
     "author": "Rust Ripper",
-    "version": (0, 2, 2),
+    "version": (0, 2, 3),
     "blender": (4, 2, 0),
     "location": "3D Viewport > Sidebar > Rust  |  File > Import",
     "description": "Import Rust Ripper GLB exports: PBR materials, blend layers, light tools, bridge connection",
@@ -102,8 +102,7 @@ def _build_paint_nodes(glb_path, materials):
             continue
         albedo_out = bsdf.inputs["Base Color"].links[0].from_socket
 
-        mask_img = bpy.data.images.load(mask_path, check_existing=True)
-        mask_img.colorspace_settings.name = "Non-Color"
+        mask_img = _load_image(mask_path, srgb=False)
         mask_node = tree.nodes.new("ShaderNodeTexImage")
         mask_node.image = mask_img
         mask_node.label = "Paint Mask"
@@ -140,6 +139,22 @@ def _texture_entry(mat, slot):
 def _sidecar_path(glb_path, texture_name):
     path = f"{os.path.splitext(glb_path)[0]}.{texture_name}.png"
     return path if os.path.exists(path) else None
+
+
+def _load_image(path, srgb):
+    """Load keyed by (file, colour space). One texture can serve two roles
+    with different spaces (a metal-gloss map reused as a blend mask): sharing
+    one datablock lets the last loader flip the space for both, corrupting
+    the other role. Same file + same space reuses; different space duplicates."""
+    space = "sRGB" if srgb else "Non-Color"
+    normalized = os.path.normpath(path)
+    for img in bpy.data.images:
+        if img.filepath and os.path.normpath(bpy.path.abspath(img.filepath)) == normalized \
+                and img.colorspace_settings.name == space:
+            return img
+    img = bpy.data.images.load(path, check_existing=False)
+    img.colorspace_settings.name = space
+    return img
 
 
 def _material_color_attributes(mat, objects):
@@ -363,10 +378,8 @@ def _wire_layer_metal_rough(tree, mat, objects, layer_node, glb_path, floats,
     path = entry and _sidecar_path(glb_path, entry["name"])
     gloss_scale = floats.get(gloss_float, 1.0) if gloss_float else 1.0
     if path:
-        img = bpy.data.images.load(path, check_existing=True)
-        img.colorspace_settings.name = "Non-Color"
         tex = nodes.new("ShaderNodeTexImage")
-        tex.image = img
+        tex.image = _load_image(path, srgb=False)
         tex.label = f"{label} metal-gloss"
         _wire_uv(tree, tex, mat, objects, uv_index, entry, f"{label} mg")
         rough = nodes.new("ShaderNodeMath")
@@ -413,10 +426,8 @@ def _wire_layer_normal(tree, mat, objects, layer_node, glb_path, floats,
     if not path:
         return
     nodes, links = tree.nodes, tree.links
-    img = bpy.data.images.load(path, check_existing=True)
-    img.colorspace_settings.name = "sRGB" if entry.get("srgb", False) else "Non-Color"
     tex = nodes.new("ShaderNodeTexImage")
-    tex.image = img
+    tex.image = _load_image(path, entry.get("srgb", False))
     tex.label = f"{label} normal"
     _wire_uv(tree, tex, mat, objects, uv_index, entry, f"{label} nrm")
     nmap = nodes.new("ShaderNodeNormalMap")
@@ -476,11 +487,9 @@ def _build_blend_layer_nodes(glb_path, materials, objects):
             # the exporter records each texture's ColorSpace: Gamma-flagged
             # textures are sRGB-DECODED by the sampler before the shader sees
             # them - Blender must match or every mask threshold shifts
-            img = bpy.data.images.load(path, check_existing=True)
             srgb = entry.get("srgb", default_srgb) if entry else default_srgb
-            img.colorspace_settings.name = "sRGB" if srgb else "Non-Color"
             node = nodes.new("ShaderNodeTexImage")
-            node.image = img
+            node.image = _load_image(path, srgb)
             node.label = label
             return node
 
@@ -763,21 +772,17 @@ def _build_blend4way_nodes(glb_path, materials, objects):
                 authored = list(colors.get(f"_BlendLayer{n}_Color", [1.0, 1.0, 1.0, 1.0]))
                 layer.inputs["Layer Color"].default_value = (*[c ** 2.2 for c in authored[:3]], 1.0)
 
-            img = bpy.data.images.load(albedo_path, check_existing=True)
             # sampler colour space comes from the texture asset (extras srgb)
-            img.colorspace_settings.name = "sRGB" if albedo_entry.get("srgb", True) else "Non-Color"
             albedo_node = nodes.new("ShaderNodeTexImage")
-            albedo_node.image = img
+            albedo_node.image = _load_image(albedo_path, albedo_entry.get("srgb", True))
             albedo_node.label = f"_BlendLayer{n}_AlbedoMap"
             _wire_uv(tree, albedo_node, mat, objects,
                      int(floats.get(f"_BlendLayer{n}_UVSet", 0.0)), albedo_entry, f"_BlendLayer{n}")
             links.new(albedo_node.outputs["Color"], layer.inputs["Layer Albedo"])
             links.new(albedo_node.outputs["Alpha"], layer.inputs["Layer Albedo Alpha"])
 
-            mask_img = bpy.data.images.load(mask_path, check_existing=True)
-            mask_img.colorspace_settings.name = "sRGB" if mask_entry.get("srgb", False) else "Non-Color"
             mask_node = nodes.new("ShaderNodeTexImage")
-            mask_node.image = mask_img
+            mask_node.image = _load_image(mask_path, mask_entry.get("srgb", False))
             mask_node.label = f"_BlendLayer{n}_BlendMaskMap"
             _wire_uv(tree, mask_node, mat, objects,
                      int(floats.get(f"_BlendLayer{n}_BlendMaskUVSet", 0.0)), mask_entry, f"_BlendLayer{n} mask")
@@ -908,6 +913,24 @@ def _count_fur_materials(materials):
 
 
 # ------------------------------------------------------------- node cleanup
+
+def _ensure_weight_attributes(objects, materials):
+    """Unity substitutes WHITE for a missing vertex-colour stream, so layer
+    weights on colourless meshes read 1.0 in game. EEVEE instead renders a
+    missing attribute reference as error pink - give those meshes a white
+    _RUST_COLOR so the graphs shade exactly like the game."""
+    referencing = {m.name for m in materials if m and m.use_nodes and any(
+        n.type == "VERTEX_COLOR" and n.layer_name == "_RUST_COLOR" for n in m.node_tree.nodes)}
+    added = 0
+    for obj in objects:
+        if obj.type != "MESH" or "_RUST_COLOR" in obj.data.color_attributes:
+            continue
+        if any(s.material and s.material.name in referencing for s in obj.material_slots):
+            attr = obj.data.color_attributes.new("_RUST_COLOR", "BYTE_COLOR", "POINT")
+            attr.data.foreach_set("color", [1.0] * (len(attr.data) * 4))
+            added += 1
+    return added
+
 
 def _prune_unused_nodes(tree):
     """Remove nodes with no path to any output (Material Output or the glTF
@@ -1182,6 +1205,7 @@ def _import_glb(context, filepath):
     # prune dead nodes first, then lay out: the Node Arrange extension
     # (full Sugiyama - crossing minimization, true node sizes) does the
     # arranging when installed; the built-in column layout is the fallback
+    _ensure_weight_attributes(new_objects, new_materials)
     trees = [mat.node_tree for mat in new_materials if mat.use_nodes]
     for tree in trees:
         _prune_unused_nodes(tree)
