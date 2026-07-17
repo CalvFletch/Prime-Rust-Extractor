@@ -84,6 +84,15 @@ Assert "helipad: NO palette attributes"    (-not ($g.meshes.primitives.attribute
 $fourWayMats = @(); for ($i = 0; $i -lt $g.materials.Count; $i++) { if ($g.materials[$i].extras.unity_shader -like "*Blend 4-Way*") { $fourWayMats += $i } }
 Assert "helipad: NO COLOR_0 on 4-Way prims" (-not ($g.meshes.primitives | Where-Object { $_.attributes.COLOR_0 -ne $null -and $fourWayMats -contains $_.material }))
 
+# --- wind turbine: 4-Way materials author _ApplyVertexColor=1 but the
+# --- shader family has no tint path - COLOR_0 must always demote ---
+$wtPath = Export-Asset "wind_turbine"
+$g = Get-GlbJson $wtPath
+$wt4way = @(); for ($i = 0; $i -lt $g.materials.Count; $i++) { if ($g.materials[$i].extras.unity_shader -like "*Blend 4-Way*") { $wt4way += $i } }
+Assert "turbine: 4-way materials present"     ($wt4way.Count -ge 1)
+Assert "turbine: NO COLOR_0 on 4-Way prims"   (-not ($g.meshes.primitives | Where-Object { $_.attributes.COLOR_0 -ne $null -and $wt4way -contains $_.material }))
+Assert "turbine: weights kept in _RUST_COLOR" (($g.meshes.primitives | Where-Object { $_.attributes._RUST_COLOR -ne $null }).Count -ge 1)
+
 # --- barrel: detail paint baked + paint attribute ---
 $g = Get-GlbJson (Export-Asset "loot-barrel-1")
 Assert "barrel: detail tint baked image"     (($g.images | Where-Object { $_.name -like "*_detailtint" }))

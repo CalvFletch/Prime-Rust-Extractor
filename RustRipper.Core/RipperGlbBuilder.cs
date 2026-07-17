@@ -1060,8 +1060,11 @@ public class RipperGlbBuilder
             // _ApplyVertexAlpha alone modulates by ALPHA only; shipping COLOR_0
             // for it would let viewers multiply the RGB channels in too (4-way
             // blend WEIGHTS rendered as rainbow paint). Those colours still
-            // ship in _RUST_COLOR.
+            // ship in _RUST_COLOR. The numbered-layer shader family declares
+            // _ApplyVertexColor but its compiled programs have no tint path
+            // at all (profile fact) - the float is ignored there.
             if (material is not null
+                && !ShaderProfiles.Resolve(material.Shader_C21P?.ParsedForm.Name_R.String ?? "").VertexColorIsLayerWeights
                 && RipperMaterialFactory.TryGetFloat(material, "_ApplyVertexColor", out var avc) && avc != 0f)
             {
                 vertexColorTintMaterials.Add(material.PathID);

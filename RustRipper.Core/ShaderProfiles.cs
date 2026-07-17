@@ -41,6 +41,12 @@ public sealed record ShaderProfile
 
     /// <summary>_SmoothnessTextureChannel==1 routes smoothness from the albedo alpha.</summary>
     public bool SupportsAlbedoAlphaSmoothness { get; init; }
+
+    /// <summary>The shader's compiled programs use vertex colour exclusively
+    /// as layer weights - no vertex-tint path exists (no such keyword in the
+    /// shipped variants), so _ApplyVertexColor is declared-but-unused and
+    /// COLOR_0 must always demote to _RUST_COLOR.</summary>
+    public bool VertexColorIsLayerWeights { get; init; }
 }
 
 public static class ShaderProfiles
@@ -57,8 +63,6 @@ public static class ShaderProfiles
         [
             "Rust/Standard",
             "Rust/Standard (Specular setup)",
-            "Rust/Standard Blend 4-Way",
-            "Rust/Standard Blend 4-Way (Specular setup)",
             "Standard",
             "Autodesk Interactive",
             "Rust/Standard Blend Layer",
@@ -73,7 +77,6 @@ public static class ShaderProfiles
             "Rust/Standard Terrain Blend (Specular setup)",
             // program-verified (shaderdump): standard slots + numbered blend
             // layers; the packed-mask macro system rides in extras
-            "Rust/Standard Packed Mask Blend",
             "Developer/LocalCoord Diffuse (Specular Setup)",
             "Developer/LocalCoord Diffuse (Metallic Setup)",
             "Custom/Standard Refraction",
@@ -143,7 +146,24 @@ public static class ShaderProfiles
         SpecGlossSlots = ["_SpecularMap"],
     };
 
-    public static readonly ShaderProfile[] All = [Standard, AnimalFur, CoreFoliage, DeferredDecal, CoreSkin];
+    /// <summary>The numbered-blend-layer family. Identical slot layout to
+    /// Standard, but the compiled programs have NO vertex-tint path (the
+    /// shipped keyword sets contain no such variant; the asm reads COLOR
+    /// only as layer weights r/g/b) - materials may still author
+    /// _ApplyVertexColor=1, and it is declared-but-unused there.</summary>
+    public static readonly ShaderProfile BlendLayerWeights = Standard with
+    {
+        Id = "blend-layer-weights",
+        Shaders =
+        [
+            "Rust/Standard Blend 4-Way",
+            "Rust/Standard Blend 4-Way (Specular setup)",
+            "Rust/Standard Packed Mask Blend",
+        ],
+        VertexColorIsLayerWeights = true,
+    };
+
+    public static readonly ShaderProfile[] All = [Standard, BlendLayerWeights, AnimalFur, CoreFoliage, DeferredDecal, CoreSkin];
 
     private static readonly Dictionary<string, ShaderProfile> byShader = Build();
 
