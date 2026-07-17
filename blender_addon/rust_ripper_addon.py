@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Rust Ripper",
     "author": "Rust Ripper",
-    "version": (0, 2, 3),
+    "version": (0, 2, 4),
     "blender": (4, 2, 0),
     "location": "3D Viewport > Sidebar > Rust  |  File > Import",
     "description": "Import Rust Ripper GLB exports: PBR materials, blend layers, light tools, bridge connection",
@@ -955,51 +955,15 @@ def _prune_unused_nodes(tree):
     return removed
 
 
-def _extension_arrange(trees):
-    """Delegate layout to the Node Arrange extension (full Sugiyama: crossing
-    minimization, true node sizes) when it is installed and enabled. Returns
-    False so the caller can fall back to the built-in layout."""
-    if "na_arrange_selected" not in dir(bpy.ops.node):
-        return False
-    window = area = None
-    for w in bpy.context.window_manager.windows:
-        for a in w.screen.areas:
-            if a.type == "NODE_EDITOR":
-                window, area = w, a
-                break
-        if area:
-            break
-    flipped = None
-    if area is None:
-        window = next(iter(bpy.context.window_manager.windows), None)
-        if window is None:
-            return False
-        area = window.screen.areas[0]
-        flipped = (area.type, area.ui_type)
-        area.type = "NODE_EDITOR"
-        area.ui_type = "ShaderNodeTree"
-    space = area.spaces.active
-    region = next((r for r in area.regions if r.type == "WINDOW"), None)
-    if region is None:
-        return False
-    try:
-        for tree in trees:
-            space.path.start(tree)
-            for n in tree.nodes:
-                n.select = n.bl_idname != "NodeFrame"
-            with bpy.context.temp_override(window=window, area=area, region=region, space_data=space):
-                if bpy.ops.node.na_arrange_selected.poll():
-                    bpy.ops.node.na_arrange_selected()
-        return True
-    except Exception:
-        return False
-    finally:
-        if flipped:
-            area.type = flipped[0]
-            area.ui_type = flipped[1]
-
-
 # ------------------------------------------------------------- node layout
+#
+# Self-contained layered graph layout (the Sugiyama method):
+#   1. rank   - longest link distance to the output side = column
+#   2. split  - edges spanning several columns get virtual waypoints so the
+#               ordering step can route them between rows instead of across
+#   3. order  - iterative barycenter sweeps minimize link crossings
+#   4. place  - socket-anchored positions relaxed under no-overlap
+#               constraints; column x from real node widths
 
 _NODE_HEIGHT = {
     "TEX_IMAGE": 290, "BSDF_PRINCIPLED": 640, "MIX": 190, "MATH": 160,
@@ -1009,64 +973,172 @@ _NODE_HEIGHT = {
     "OUTPUT_MATERIAL": 110,
 }
 
+_MARGIN_X = 60.0
+_MARGIN_Y = 40.0
+
+
+class _Waypoint:
+    """Virtual node standing in for a long edge crossing a column."""
+    __slots__ = ("rank",)
+
+    def __init__(self, rank):
+        self.rank = rank
+
+
+def _socket_anchor(index):
+    """Approximate y offset of a socket from the node's top edge."""
+    return -(35.0 + 22.0 * index)
+
 
 def _arrange_nodes(tree):
-    """Neat left-to-right layout. Columns = longest link distance to the
-    output. Rows follow the consumers' input-socket order (base colour
-    chain is the top band, roughness below, normal below that - the BSDF's
-    own order), and every node is pulled level with the socket it feeds,
-    pushed down only when it would overlap its column neighbour."""
     nodes = [n for n in tree.nodes if n.type != "FRAME"]
-    depth = {n: 0 for n in nodes}
+    if not nodes:
+        return
+    node_set = set(nodes)
+    links = [l for l in tree.links if l.from_node in node_set and l.to_node in node_set]
+
+    # 1. rank: longest path to a sink (rank 0 = output column, rightmost)
+    rank = {n: 0 for n in nodes}
     for _ in range(len(nodes)):
         changed = False
-        for link in tree.links:
-            a, b = link.from_node, link.to_node
-            if a in depth and b in depth and depth[a] < depth[b] + 1:
-                depth[a] = depth[b] + 1
+        for l in links:
+            if rank[l.from_node] < rank[l.to_node] + 1:
+                rank[l.from_node] = rank[l.to_node] + 1
                 changed = True
         if not changed:
             break
 
-    # semantic order: depth-first from the output side, inputs top-to-bottom,
-    # so each column stacks in the order its chains hang off the BSDF
+    def node_height(n):
+        if isinstance(n, _Waypoint):
+            return 20.0
+        dims = getattr(n, "dimensions", None)
+        if dims is not None and dims.y > 1.0:
+            return float(dims.y)
+        return float(_NODE_HEIGHT.get(n.type, 160))
+
+    def node_width(n):
+        return 0.0 if isinstance(n, _Waypoint) else float(getattr(n, "width", 140.0))
+
+    # 2. split long edges with waypoints
+    edge_list = []
+    waypoints = []
+    for l in links:
+        a, b = l.from_node, l.to_node
+        try:
+            out_idx = list(a.outputs).index(l.from_socket)
+            in_idx = list(b.inputs).index(l.to_socket)
+        except ValueError:
+            out_idx = in_idx = 0
+        chain = [a]
+        for r in range(rank[a] - 1, rank[b], -1):
+            waypoint = _Waypoint(r)
+            waypoints.append(waypoint)
+            chain.append(waypoint)
+        chain.append(b)
+        for i in range(len(chain) - 1):
+            edge_list.append((chain[i], chain[i + 1],
+                              out_idx if i == 0 else 0,
+                              in_idx if i == len(chain) - 2 else 0))
+
+    rank_of = dict(rank)
+    rank_of.update({w: w.rank for w in waypoints})
+    columns = {}
+    for n in list(nodes) + waypoints:
+        columns.setdefault(rank_of[n], []).append(n)
+    ranks = sorted(columns)
+
+    downstream = {}
+    upstream = {}
+    for u, w, _oi, _ii in edge_list:
+        downstream.setdefault(u, []).append(w)
+        upstream.setdefault(w, []).append(u)
+
+    # 3a. initial order: depth-first from the outputs, inputs top-to-bottom,
+    # so chains start out banded in the BSDF's own socket order
     order = {}
 
     def visit(node):
         if node in order:
             return
         order[node] = len(order)
-        for socket in node.inputs:
-            for link in socket.links:
-                visit(link.from_node)
+        for parent in upstream.get(node, []):
+            visit(parent)
 
-    for node in nodes:
-        if not any(s.links for s in node.outputs):
-            visit(node)
-    for node in nodes:
-        visit(node)
+    for n in list(nodes) + waypoints:
+        if not downstream.get(n):
+            visit(n)
+    for n in list(nodes) + waypoints:
+        visit(n)
+    for r in ranks:
+        columns[r].sort(key=lambda n: order[n])
 
-    columns = {}
-    for node in nodes:
-        columns.setdefault(depth[node], []).append(node)
-    for d in sorted(columns):
-        cursor = None
-        for node in sorted(columns[d], key=lambda n: order[n]):
-            # level with the topmost socket this node feeds
+    # 3b. crossing reduction: order each column by the barycenter of its
+    # already-ordered neighbour column, sweeping both directions
+    index = {n: i for r in ranks for i, n in enumerate(columns[r])}
+    for sweep in range(4):
+        forward = sweep % 2 == 0
+        seq = ranks if forward else list(reversed(ranks))
+        neighbours = downstream if forward else upstream
+        for r in seq[1:]:
+            column = columns[r]
+
+            def barycenter(n):
+                positions = [index[m] for m in neighbours.get(n, []) if m in index]
+                return sum(positions) / len(positions) if positions else index[n]
+
+            column.sort(key=barycenter)
+            for i, n in enumerate(column):
+                index[n] = i
+
+    # 4a. y: initial stack, then median socket-anchor relaxation with
+    # order and margin constraints (forward clamp, lift back, re-clamp)
+    y = {}
+    for r in ranks:
+        cursor = 0.0
+        for n in columns[r]:
+            y[n] = cursor
+            cursor -= node_height(n) + _MARGIN_Y
+
+    edges_of = {}
+    for u, w, oi, ii in edge_list:
+        edges_of.setdefault(u, []).append((w, _socket_anchor(ii), _socket_anchor(oi)))
+        edges_of.setdefault(w, []).append((u, _socket_anchor(oi), _socket_anchor(ii)))
+
+    for iteration in range(6):
+        for r in (ranks if iteration % 2 else reversed(ranks)):
+            column = columns[r]
             desired = []
-            for socket in node.outputs:
-                for link in socket.links:
-                    consumer = link.to_node
-                    try:
-                        slot = list(consumer.inputs).index(link.to_socket)
-                    except ValueError:
-                        slot = 0
-                    desired.append(consumer.location.y - 40.0 - slot * 22.0)
-            y = max(desired) if desired else 0.0
-            if cursor is not None:
-                y = min(y, cursor)
-            node.location = (-d * 340.0, y)
-            cursor = y - _NODE_HEIGHT.get(node.type, 160) - 40.0
+            for n in column:
+                wants = [y[other] + other_anchor - own_anchor
+                         for other, other_anchor, own_anchor in edges_of.get(n, [])]
+                wants.sort()
+                desired.append(wants[len(wants) // 2] if wants else y[n])
+            for i in range(1, len(column)):
+                limit = desired[i - 1] - node_height(column[i - 1]) - _MARGIN_Y
+                if desired[i] > limit:
+                    desired[i] = limit
+            for i in range(len(column) - 2, -1, -1):
+                limit = desired[i + 1] + node_height(column[i]) + _MARGIN_Y
+                if desired[i] < limit:
+                    desired[i] = limit
+            for i in range(1, len(column)):
+                limit = desired[i - 1] - node_height(column[i - 1]) - _MARGIN_Y
+                if desired[i] > limit:
+                    desired[i] = limit
+            for i, n in enumerate(column):
+                y[n] = desired[i]
+
+    # 4b. x: columns sized by their widest node, outputs at x = 0
+    x = {}
+    for r in ranks:
+        if r == ranks[0]:
+            x[r] = 0.0
+        else:
+            width = max((node_width(n) for n in columns[r]), default=140.0)
+            x[r] = x[r - 1] - width - _MARGIN_X
+
+    for n in nodes:
+        n.location = (x[rank_of[n]], y[n])
 
 
 def _tidy_armatures(context, objects):
@@ -1209,9 +1281,7 @@ def _import_glb(context, filepath):
     trees = [mat.node_tree for mat in new_materials if mat.use_nodes]
     for tree in trees:
         _prune_unused_nodes(tree)
-    if not _extension_arrange(trees):
-        for tree in trees:
-            _arrange_nodes(tree)
+        _arrange_nodes(tree)
     return len(new_objects), hidden, painted, reused
 
 
