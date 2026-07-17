@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Rust Ripper",
     "author": "Rust Ripper",
-    "version": (0, 2, 4),
+    "version": (0, 2, 5),
     "blender": (4, 2, 0),
     "location": "3D Viewport > Sidebar > Rust  |  File > Import",
     "description": "Import Rust Ripper GLB exports: PBR materials, blend layers, light tools, bridge connection",
@@ -212,7 +212,7 @@ def _wire_uv(tree, tex_node, mat, objects, uv_index, entry, label):
 
 
 _BLEND_LAYER_GROUP = "Rust/Standard Blend Layer"
-_GROUP_VERSION = 4
+_GROUP_VERSION = 5
 
 
 def _blend_layer_group():
@@ -262,10 +262,13 @@ def _blend_layer_group():
     socket("Layer Roughness", "INPUT", "NodeSocketFloat", 1.0)
     socket("Base Normal", "INPUT", "NodeSocketVector", (0.0, 0.0, 1.0))
     socket("Layer Normal", "INPUT", "NodeSocketVector", (0.0, 0.0, 1.0))
+    socket("Base Specular", "INPUT", "NodeSocketColor", (1.0, 1.0, 1.0, 1.0))
+    socket("Layer Specular", "INPUT", "NodeSocketColor", (1.0, 1.0, 1.0, 1.0))
     socket("Color", "OUTPUT", "NodeSocketColor")
     socket("Metallic", "OUTPUT", "NodeSocketFloat")
     socket("Roughness", "OUTPUT", "NodeSocketFloat")
     socket("Normal", "OUTPUT", "NodeSocketVector")
+    socket("Specular", "OUTPUT", "NodeSocketColor")
     socket("Blend Factor", "OUTPUT", "NodeSocketFloat")
 
     nodes, links = group.nodes, group.links
@@ -356,10 +359,19 @@ def _blend_layer_group():
     normal_norm.label = "renormalize"
     links.new(normal_mix.outputs[1], normal_norm.inputs[0])
 
+    # specular workflow: layer F0 colour lerps with the same factor
+    spec_mix = nodes.new("ShaderNodeMix")
+    spec_mix.data_type = "RGBA"
+    spec_mix.label = "specular by blend"
+    links.new(clamped.outputs[0], spec_mix.inputs[0])
+    links.new(group_in.outputs["Base Specular"], spec_mix.inputs[6])
+    links.new(group_in.outputs["Layer Specular"], spec_mix.inputs[7])
+
     links.new(blend.outputs[2], group_out.inputs["Color"])
     links.new(metal_mix.outputs[0], group_out.inputs["Metallic"])
     links.new(rough_mix.outputs[0], group_out.inputs["Roughness"])
     links.new(normal_norm.outputs[0], group_out.inputs["Normal"])
+    links.new(spec_mix.outputs[2], group_out.inputs["Specular"])
     links.new(clamped.outputs[0], group_out.inputs["Blend Factor"])
     _arrange_nodes(group)
     return group
@@ -379,7 +391,9 @@ def _wire_layer_metal_rough(tree, mat, objects, layer_node, glb_path, floats,
     gloss_scale = floats.get(gloss_float, 1.0) if gloss_float else 1.0
     if path:
         tex = nodes.new("ShaderNodeTexImage")
-        tex.image = _load_image(path, srgb=False)
+        # the sampler decodes sRGB-flagged textures' RGB (alpha stays linear
+        # either way, so the gloss->roughness math is unaffected)
+        tex.image = _load_image(path, entry.get("srgb", False))
         tex.label = f"{label} metal-gloss"
         _wire_uv(tree, tex, mat, objects, uv_index, entry, f"{label} mg")
         rough = nodes.new("ShaderNodeMath")
@@ -395,6 +409,9 @@ def _wire_layer_metal_rough(tree, mat, objects, layer_node, glb_path, floats,
             links.new(tex.outputs["Color"], sep.inputs["Color"])
             links.new(sep.outputs["Red"], layer_node.inputs["Layer Metallic"])
         else:
+            # spec-gloss workflow: RGB is the layer's F0 colour - it lerps by
+            # the same blend factor in the compiled programs
+            links.new(tex.outputs["Color"], layer_node.inputs["Layer Specular"])
             layer_node.inputs["Layer Metallic"].default_value = floats.get(metallic_float, 0.0) if metallic_float else 0.0
     else:
         layer_node.inputs["Layer Metallic"].default_value = floats.get(metallic_float, 0.0) if metallic_float else 0.0
@@ -438,6 +455,20 @@ def _wire_layer_normal(tree, mat, objects, layer_node, glb_path, floats,
         nmap.uv_map = uv_name
     links.new(tex.outputs["Color"], nmap.inputs["Color"])
     links.new(nmap.outputs["Normal"], layer_node.inputs["Layer Normal"])
+
+
+def _route_specular_through(tree, bsdf, layer_node):
+    """Chain the BSDF specular tint through a layer group when the layer
+    brings its own spec-gloss map (specular workflow only)."""
+    if not layer_node.inputs["Layer Specular"].is_linked:
+        return
+    links = tree.links
+    spec_input = bsdf.inputs["Specular Tint"]
+    if spec_input.is_linked:
+        links.new(spec_input.links[0].from_socket, layer_node.inputs["Base Specular"])
+    else:
+        layer_node.inputs["Base Specular"].default_value = tuple(spec_input.default_value)
+    links.new(layer_node.outputs["Specular"], spec_input)
 
 
 def _route_normal_through(tree, bsdf, layer_node):
@@ -559,6 +590,7 @@ def _build_blend_layer_nodes(glb_path, materials, objects):
                            "_DetailNormalMap", "_DetailNormalMapScale",
                            int(floats.get("_UVSec", 0.0)), "_Detail")
         _route_normal_through(tree, bsdf, layer)
+        _route_specular_through(tree, bsdf, layer)
         built += 1
     return built
 
@@ -577,11 +609,11 @@ def _blend4way_group():
         out   = lerp(base, layer, blend)
     """
     group = bpy.data.node_groups.get(_BLEND4WAY_GROUP)
-    if group is not None and group.get("rust_ripper_version", 0) >= 3:
+    if group is not None and group.get("rust_ripper_version", 0) >= 4:
         return group
     if group is None:
         group = bpy.data.node_groups.new(_BLEND4WAY_GROUP, "ShaderNodeTree")
-    group["rust_ripper_version"] = 3
+    group["rust_ripper_version"] = 4
     group.use_fake_user = True
 
     present = {(item.name, item.in_out) for item in group.interface.items_tree
@@ -610,10 +642,13 @@ def _blend4way_group():
     socket("Layer Roughness", "INPUT", "NodeSocketFloat", 1.0)
     socket("Base Normal", "INPUT", "NodeSocketVector", (0.0, 0.0, 1.0))
     socket("Layer Normal", "INPUT", "NodeSocketVector", (0.0, 0.0, 1.0))
+    socket("Base Specular", "INPUT", "NodeSocketColor", (1.0, 1.0, 1.0, 1.0))
+    socket("Layer Specular", "INPUT", "NodeSocketColor", (1.0, 1.0, 1.0, 1.0))
     socket("Color", "OUTPUT", "NodeSocketColor")
     socket("Metallic", "OUTPUT", "NodeSocketFloat")
     socket("Roughness", "OUTPUT", "NodeSocketFloat")
     socket("Normal", "OUTPUT", "NodeSocketVector")
+    socket("Specular", "OUTPUT", "NodeSocketColor")
     socket("Blend Factor", "OUTPUT", "NodeSocketFloat")
 
     nodes, links = group.nodes, group.links
@@ -710,10 +745,19 @@ def _blend4way_group():
     normal_norm.label = "renormalize"
     links.new(normal_mix.outputs[1], normal_norm.inputs[0])
 
+    # specular workflow: layer F0 colour lerps with the same factor
+    spec_mix = nodes.new("ShaderNodeMix")
+    spec_mix.data_type = "RGBA"
+    spec_mix.label = "specular by blend"
+    links.new(clamped.outputs[0], spec_mix.inputs[0])
+    links.new(group_in.outputs["Base Specular"], spec_mix.inputs[6])
+    links.new(group_in.outputs["Layer Specular"], spec_mix.inputs[7])
+
     links.new(blend.outputs[2], group_out.inputs["Color"])
     links.new(metal_mix.outputs[0], group_out.inputs["Metallic"])
     links.new(rough_mix.outputs[0], group_out.inputs["Roughness"])
     links.new(normal_norm.outputs[0], group_out.inputs["Normal"])
+    links.new(spec_mix.outputs[2], group_out.inputs["Specular"])
     links.new(clamped.outputs[0], group_out.inputs["Blend Factor"])
     _arrange_nodes(group)
     return group
@@ -807,6 +851,7 @@ def _build_blend4way_nodes(glb_path, materials, objects):
                                f"_BlendLayer{n}_NormalMap", f"_BlendLayer{n}_NormalMapScale",
                                int(floats.get(f"_BlendLayer{n}_UVSet", 0.0)), f"_BlendLayer{n}")
             _route_normal_through(tree, bsdf, layer)
+            _route_specular_through(tree, bsdf, layer)
         links.new(chain_socket, base_input)
         built += 1
     return built

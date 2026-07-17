@@ -421,7 +421,43 @@ public class RipperMaterialFactory
             builder.WithChannelParam(KnownChannel.Transmission, KnownProperty.TransmissionFactor, 0.9f);
         }
 
+        // --- authored slot tiling -> KHR_texture_transform ---
+        // base maps tile too (nacelle _MainTex at 0.5x); slot order mirrors
+        // the channel assignment chains above
+        ApplyChannelTransform(builder, KnownChannel.BaseColor, material, profile.BaseColorSlots);
+        ApplyChannelTransform(builder, KnownChannel.Normal, material, profile.NormalSlots);
+        ApplyChannelTransform(builder, KnownChannel.MetallicRoughness, material,
+            profile.PackedOrmSlots.Concat(profile.MetalGlossSlots).Concat(profile.SpecGlossSlots).Concat(profile.BaseColorSlots).ToArray());
+        ApplyChannelTransform(builder, KnownChannel.Occlusion, material,
+            profile.PackedOrmSlots.Concat(profile.OcclusionSlots).ToArray());
+        ApplyChannelTransform(builder, KnownChannel.Emissive, material, profile.EmissiveSlots);
+        ApplyChannelTransform(builder, KnownChannel.SpecularColor, material, profile.SpecGlossSlots);
+
         return builder;
+    }
+
+    /// <summary>Authored slot tiling as a KHR_texture_transform on the
+    /// channel's texture. Unity's ST lives in bottom-left UV space, glTF is
+    /// top-left: offsetY' = 1 - scaleY - offsetY. The first resolvable slot
+    /// is the one the channel chain sourced.</summary>
+    private static void ApplyChannelTransform(MaterialBuilder builder, KnownChannel channel, IMaterial material, params string[] slotNames)
+    {
+        foreach (var slot in slotNames)
+        {
+            if (!material.TryGetTextureProperty(slot, out var texEnv)
+                || texEnv.Texture.TryGetAsset(material.Collection) is not ITexture2D)
+            {
+                continue;
+            }
+            var scale = texEnv.Scale;
+            var offset = texEnv.Offset;
+            if (scale.X != 1f || scale.Y != 1f || offset.X != 0f || offset.Y != 0f)
+            {
+                builder.GetChannel(channel)?.Texture?.WithTransform(
+                    offset.X, 1f - scale.Y - offset.Y, scale.X, scale.Y);
+            }
+            return;
+        }
     }
 
     private static void SetChannelUv(MaterialBuilder builder, KnownChannel channel, int uvSet)
