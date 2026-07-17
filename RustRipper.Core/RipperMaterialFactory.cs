@@ -765,6 +765,10 @@ public class RipperMaterialFactory
         pngStream.Position = 0;
         using var img = Image.Load<Rgba32>(pngStream);
         var normalSource = baseMode == "normal" ? DetectNormalLayout(img) : NormalLayout.XRed_ZBlue;
+        // sRGB-flagged sources are DECODED by the game's sampler before the
+        // shader reads them - colour channels used as data (metal, gloss)
+        // must decode the same way. Alpha is never sRGB-converted.
+        var srgbSource = texture.ColorSpace_C28 == 1;
         img.ProcessPixelRows(accessor =>
         {
             for (var y = 0; y < accessor.Height; y++)
@@ -773,13 +777,14 @@ public class RipperMaterialFactory
                 for (var x = 0; x < row.Length; x++)
                 {
                     var p = row[x];
+                    byte D(byte v) => srgbSource ? srgbToLinearLut[v] : v;
                     row[x] = baseMode switch
                     {
                         "normal" => ReconstructNormal(p, normalSource),
-                        "metalgloss" => new Rgba32(0, Roughness(p.A, scale), p.R, 255),
+                        "metalgloss" => new Rgba32(0, Roughness(p.A, scale), D(p.R), 255),
                         "specgloss" => new Rgba32(0, Roughness(p.A, scale), 0, 255),
                         "albedogloss" => new Rgba32(0, Roughness(p.A, scale), 255, 255),
-                        "packedmap" => new Rgba32(p.A, Roughness(p.G, scale), p.B, 255),
+                        "packedmap" => new Rgba32(p.A, Roughness(D(p.G), scale), D(p.B), 255),
                         "lumalpha" => new Rgba32(p.R, p.G, p.B, (byte)(Math.Max(p.R, Math.Max(p.G, p.B)) * p.A / 255)),
                         _ => p,
                     };
@@ -794,6 +799,22 @@ public class RipperMaterialFactory
     /// <summary>Unity smoothness (texture alpha x scale) to glTF roughness.</summary>
     private static byte Roughness(byte smoothness, float scale)
         => (byte)Math.Clamp(255f - smoothness * scale, 0f, 255f);
+
+    /// <summary>Exact sRGB EOTF per byte - what the GPU sampler applies to
+    /// the colour channels of sRGB-flagged textures.</summary>
+    private static readonly byte[] srgbToLinearLut = BuildSrgbToLinearLut();
+
+    private static byte[] BuildSrgbToLinearLut()
+    {
+        var lut = new byte[256];
+        for (var i = 0; i < 256; i++)
+        {
+            var c = i / 255f;
+            var linear = c <= 0.04045f ? c / 12.92f : MathF.Pow((c + 0.055f) / 1.055f, 2.4f);
+            lut[i] = (byte)Math.Clamp(MathF.Round(linear * 255f), 0f, 255f);
+        }
+        return lut;
+    }
 
     public enum NormalLayout
     {

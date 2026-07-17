@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Rust Ripper",
     "author": "Rust Ripper",
-    "version": (0, 2, 5),
+    "version": (0, 2, 6),
     "blender": (4, 2, 0),
     "location": "3D Viewport > Sidebar > Rust  |  File > Import",
     "description": "Import Rust Ripper GLB exports: PBR materials, blend layers, light tools, bridge connection",
@@ -957,6 +957,50 @@ def _count_fur_materials(materials):
     return count
 
 
+_DECAL_SHADERS = {
+    "Rust/Standard Decal",
+    "Rust/Standard Decal (Specular setup)",
+    "Rust/Standard Decal (Poster)",
+    "Decal/Deferred Decal",
+}
+
+
+def _build_decal_clips(materials):
+    """Decal-family materials render through the deferred decal system,
+    whose compiled program DISCARDS below _Cutoff before blending. Plain
+    glTF BLEND shows the sub-cutoff content the game clips - the authored
+    soft drop shadows in the atlas alpha. Rebuild the game's behaviour:
+    alpha' = alpha x (alpha >= _Cutoff), material stays BLEND."""
+    built = 0
+    for mat in materials:
+        if not mat or not mat.use_nodes:
+            continue
+        if mat.get("unity_shader", "") not in _DECAL_SHADERS:
+            continue
+        floats = mat.get("unity_floats")
+        cutoff = floats.get("_Cutoff", 0.0) if floats is not None else 0.0
+        if cutoff <= 0.0 or mat.surface_render_method != "BLENDED":
+            continue
+        tree = mat.node_tree
+        bsdf = next((n for n in tree.nodes if n.type == "BSDF_PRINCIPLED"), None)
+        if bsdf is None or not bsdf.inputs["Alpha"].is_linked:
+            continue
+        alpha_src = bsdf.inputs["Alpha"].links[0].from_socket
+        gate = tree.nodes.new("ShaderNodeMath")
+        gate.operation = "GREATER_THAN"
+        gate.label = "decal discard at _Cutoff"
+        gate.inputs[1].default_value = cutoff
+        clipped = tree.nodes.new("ShaderNodeMath")
+        clipped.operation = "MULTIPLY"
+        clipped.label = "clip, then blend"
+        tree.links.new(alpha_src, gate.inputs[0])
+        tree.links.new(alpha_src, clipped.inputs[0])
+        tree.links.new(gate.outputs[0], clipped.inputs[1])
+        tree.links.new(clipped.outputs[0], bsdf.inputs["Alpha"])
+        built += 1
+    return built
+
+
 # ------------------------------------------------------------- node cleanup
 
 def _ensure_weight_attributes(objects, materials):
@@ -1313,6 +1357,7 @@ def _import_glb(context, filepath):
     painted = _build_paint_nodes(filepath, new_materials)
     painted += _build_blend_layer_nodes(filepath, new_materials, new_objects)
     painted += _build_blend4way_nodes(filepath, new_materials, new_objects)
+    painted += _build_decal_clips(new_materials)
     _compact_alpha_clips(new_materials)
     if _count_fur_materials(new_materials) and context.scene.render.engine == "CYCLES":
         # fur shells stack many alpha layers; rays that exhaust Cycles'
